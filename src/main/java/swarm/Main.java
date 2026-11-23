@@ -1,6 +1,7 @@
 package swarm;
 
 import java.lang.management.ManagementFactory;
+import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,6 +19,24 @@ public final class Main {
         new Game().run();
     }
 
+    /** Windows'ta jar çift tıklanarak açıldıysa (konsol yok) javaw kullan ki siyah pencere çıkmasın. */
+    private static String javaExecutable() {
+        String bin = Paths.get(System.getProperty("java.home"), "bin").toString();
+        boolean win = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
+        if (win && !hasTerminal() && Files.exists(Paths.get(bin, "javaw.exe"))) return Paths.get(bin, "javaw.exe").toString();
+        return Paths.get(bin, win ? "java.exe" : "java").toString();
+    }
+
+    private static boolean hasTerminal() {
+        java.io.Console c = System.console();
+        if (c == null) return false;
+        try { // Java 22+: console() terminal olmasa da nesne döndürebilir
+            return (Boolean) java.io.Console.class.getMethod("isTerminal").invoke(c);
+        } catch (ReflectiveOperationException e) {
+            return true;
+        }
+    }
+
     private static boolean relaunchIfNeeded() {
         if ("true".equals(System.getProperty("swarm.child"))) return false;
         boolean mac = System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("mac");
@@ -29,7 +48,7 @@ public final class Main {
         if (!needFirstThread && !needUnsafe) return false;
 
         List<String> cmd = new ArrayList<>();
-        cmd.add(Paths.get(System.getProperty("java.home"), "bin", "java").toString());
+        cmd.add(javaExecutable());
         if (mac) cmd.add("-XstartOnFirstThread");
         if (feature >= 22) cmd.add("--enable-native-access=ALL-UNNAMED");
         if (feature >= 23) cmd.add("--sun-misc-unsafe-memory-access=allow");

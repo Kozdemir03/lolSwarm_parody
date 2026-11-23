@@ -7,6 +7,7 @@ import org.lwjgl.glfw.GLFWErrorCallback;
 import org.lwjgl.opengl.GL;
 import org.lwjgl.system.MemoryStack;
 
+import java.net.SocketException;
 import java.nio.IntBuffer;
 import java.util.*;
 import java.util.function.Consumer;
@@ -19,10 +20,15 @@ import static org.lwjgl.system.MemoryUtil.NULL;
 public final class Game {
     static final float ARENA = 80f;
     static final float BOSS_TIME = 480f; // 8:00
+    static final float REVIVE_TIME = 3f, REVIVE_RANGE = 2.6f;
     static final int FOG = 0x0d1220;
-    static final int MAX_ENEMIES = 420;
+    static final int MAX_ENEMIES = 450;
+    static final String[] KEYS = {"Q", "E", "R", "F"};
+    static final int[] CAST_KEYS = {GLFW_KEY_Q, GLFW_KEY_E, GLFW_KEY_R, GLFW_KEY_F};
 
-    enum State { MENU, PLAY, LEVELUP, PAUSE, DEAD, WIN }
+    enum State { MENU, LOBBY, PLAY, LEVELUP, PAUSE, DEAD, WIN }
+
+    enum Role { SOLO, HOST, CLIENT }
 
     long window;
     int winW = 1600, winH = 900, fbW = 1600, fbH = 900;
@@ -30,13 +36,20 @@ public final class Game {
     UI ui;
     final Input in = new Input();
     State state = State.MENU;
+    Role role = Role.SOLO;
+    NetSession net;
     final Random rng = new Random();
 
+    /** Tüm oyuncular (host'ta simüle edilir, istemcide ağdan gelir). */
+    final ArrayList<Player> players = new ArrayList<>();
+    /** Bu bilgisayardaki oyuncu. */
     Player player = new Player();
-    Champion champ;
-    int champIndex, menuSel;
+    int menuSel;
     Champion[] previews;
     float menuAnim;
+    boolean escMenu;
+    String notice;
+    float noticeT;
 
     final ArrayList<Enemy> enemies = new ArrayList<>();
     final ArrayList<Projectile> projectiles = new ArrayList<>();
@@ -51,26 +64,24 @@ public final class Game {
     final ArrayList<Telegraph> telegraphs = new ArrayList<>();
     final ArrayList<FallingSword> swords = new ArrayList<>();
     final ArrayList<Prop> props = new ArrayList<>();
+    final ArrayList<FxEvent> fxEvents = new ArrayList<>();
 
     float time, spawnAcc, nextElite, nextWave;
-    int kills;
+    int kills, gameId, nextEnemyId = 1, nextProjId = 1;
     boolean bossSpawned;
     Enemy boss;
-    final Map<String, Integer> upLevels = new LinkedHashMap<>();
-    final Map<String, Upgrade> upgradeIndex = new HashMap<>();
-    List<Upgrade> choices = new ArrayList<>();
-    int pendingLevels;
-    float levelUpDelay, endTimer;
+    boolean bossAliveNet;
+    float bossFracNet;
+    int teamLevel = 1, pendingLevels, pickRound;
+    float teamXp, xpNext, levelUpDelay, endTimer;
     String banner;
     float bannerT;
     int bannerColor;
 
-    float bladeAngle, chainTimer, auraTimer;
-
     final Matrix4f proj = new Matrix4f(), view = new Matrix4f(), pv = new Matrix4f(), invPv = new Matrix4f();
     final Vector3f camPos = new Vector3f();
     float camX, camZ, shakeAmt;
-    float mouseX, mouseZ, aimX, aimZ, tx, tz;
+    float mouseX, mouseZ;
     final Matrix4f base = new Matrix4f();
     private final Vector4f v4 = new Vector4f(), v4b = new Vector4f();
 
@@ -97,6 +108,7 @@ public final class Game {
             in.endFrame();
             glfwSwapBuffers(window);
         }
+        closeNet();
         glfwDestroyWindow(window);
         glfwTerminate();
     }
@@ -131,7 +143,6 @@ public final class Game {
     void initLogic() {
         previews = new Champion[]{create(0), create(1), create(2)};
         for (int i = 0; i < grid.length; i++) grid[i] = new ArrayList<>();
-        for (Upgrade u : Upgrade.generic()) upgradeIndex.put(u.id, u);
         genProps();
     }
 
@@ -170,50 +181,173 @@ public final class Game {
         }
     }
 
-    void startGame(int idx) {
-        champIndex = idx;
-        champ = create(idx);
-        player = new Player();
-        player.maxHp = player.hp = champ.baseHp;
-        player.speed = champ.baseSpeed;
-        player.xpNext = xpFor(1);
-        enemies.clear(); projectiles.clear(); orbs.clear(); particles.clear(); rings.clear(); texts.clear();
-        traps.clear(); zones.clear(); beams.clear(); timed.clear(); telegraphs.clear(); swords.clear();
-        time = 0; kills = 0; spawnAcc = 0; nextElite = 60; nextWave = 35; bossSpawned = false; boss = null;
-        upLevels.clear(); pendingLevels = 0; endTimer = 0;
-        bladeAngle = 0; chainTimer = 1; auraTimer = 0;
-        for (Upgrade u : champ.special()) upgradeIndex.put(u.id, u);
-        camX = 0; camZ = 0;
+    // ================================================================== oyuncular / oturumlar
+    Player makePlayer(int id, int champIdx, boolean local) {
+        Player p = new Player();
+        p.id = id;
+        p.champIndex = champIdx;
+        p.local = local;
+        p.label = "P" + (id + 1);
+        p.champ = create(champIdx).bind(p);
+        p.maxHp = p.hp = p.champ.baseHp;
+        p.speed = p.champ.baseSpeed;
+        for (Upgrade u : Upgrade.generic()) p.upIndex.put(u.id, u);
+        for (Upgrade u : p.champ.special()) p.upIndex.put(u.id, u);
+        return p;
+    }
+
+    Player find(int id) {
+        for (Player p : players) if (p.id == id) return p;
+        return null;
+    }
+
+    void startSolo(int idx) {
+        closeNet();
+        role = Role.SOLO;
+        players.clear();
+        player = makePlayer(0, idx, true);
+        players.add(player);
+        beginRun();
+    }
+
+    void hostLobby() {
+        closeNet();
+        try {
+            net = NetSession.host(this);
+        } catch (SocketException e) {
+            notice = "Ağ açılamadı: " + e.getMessage();
+            noticeT = 5;
+            return;
+        }
+        role = Role.HOST;
+        players.clear();
+        player = makePlayer(0, menuSel, true);
+        players.add(player);
+        enterLobby();
+    }
+
+    void joinLobby() {
+        closeNet();
+        try {
+            net = NetSession.client(this);
+        } catch (SocketException e) {
+            notice = "Ağ açılamadı: " + e.getMessage();
+            noticeT = 5;
+            return;
+        }
+        role = Role.CLIENT;
+        players.clear();
+        player = makePlayer(-1, menuSel, true);
+        enterLobby();
+    }
+
+    private void enterLobby() {
+        state = State.LOBBY;
+        in.typed.setLength(0);
+        in.textMode = true;
+    }
+
+    void leaveToMenu(String msg) {
+        closeNet();
+        role = Role.SOLO;
+        state = State.MENU;
+        players.clear();
+        escMenu = false;
+        in.textMode = false;
+        if (msg != null) { notice = msg; noticeT = 6; }
+    }
+
+    void closeNet() {
+        if (net != null) {
+            net.close();
+            net = null;
+        }
+    }
+
+    /** Host / tek oyuncu: yeni bir koşu başlat (oyuncular yenilenir, aynı şampiyonlar). */
+    void beginRun() {
+        List<Player> old = new ArrayList<>(players);
+        players.clear();
+        for (int i = 0; i < old.size(); i++) {
+            Player o = old.get(i);
+            Player p = makePlayer(o.id, o.champIndex, o.local);
+            if (old.size() > 1) {
+                double a = i * Math.PI * 2 / old.size();
+                p.x = (float) Math.cos(a) * 2.5f;
+                p.z = (float) Math.sin(a) * 2.5f;
+            }
+            players.add(p);
+            if (p.local) player = p;
+        }
+        resetWorld();
+        gameId = (gameId + 1) & 0x7f;
         state = State.PLAY;
-        banner("Hayatta kal! 8:00'de Void Titanı uyanır.", 4f, 0xffffffff);
+        in.textMode = false;
+        banner(players.size() > 1 ? "Birlikte hayatta kalın! 8:00'de Void Titanı uyanır." : "Hayatta kal! 8:00'de Void Titanı uyanır.", 4f, 0xffffffff);
+    }
+
+    /** İstemci: host yeni koşu başlattı. */
+    void clientBeginRun() {
+        resetWorld();
+        in.textMode = false;
+        escMenu = false;
+    }
+
+    private void resetWorld() {
+        enemies.clear(); projectiles.clear(); orbs.clear(); particles.clear(); rings.clear(); texts.clear();
+        traps.clear(); zones.clear(); beams.clear(); timed.clear(); telegraphs.clear(); swords.clear(); fxEvents.clear();
+        time = 0; kills = 0; spawnAcc = 0; nextElite = 60; nextWave = 35; bossSpawned = false; boss = null;
+        bossAliveNet = false;
+        teamLevel = 1; teamXp = 0; xpNext = xpFor(1); pendingLevels = 0; pickRound = 0; endTimer = 0;
+        camX = player.x;
+        camZ = player.z;
+        escMenu = false;
+    }
+
+    void removePlayer(int id) {
+        Player p = find(id);
+        if (p == null) return;
+        players.remove(p);
+        if (state == State.LEVELUP) finishPickIfDone();
+        if (state == State.PLAY && allDown()) state = State.DEAD;
     }
 
     static float xpFor(int lvl) { return 6 + lvl * 5 + lvl * lvl * 0.35f; }
 
-    int lvl(String id) { return upLevels.getOrDefault(id, 0); }
+    boolean allDown() {
+        for (Player p : players) if (!p.downed) return false;
+        return true;
+    }
+
+    Player nearestAlive(float x, float z) {
+        Player best = null;
+        float bd = Float.MAX_VALUE;
+        for (Player p : players) {
+            if (p.downed) continue;
+            float dx = p.x - x, dz = p.z - z, d = dx * dx + dz * dz;
+            if (d < bd) { bd = d; best = p; }
+        }
+        return best;
+    }
+
+    private Player randomAlive() {
+        List<Player> a = new ArrayList<>();
+        for (Player p : players) if (!p.downed) a.add(p);
+        return a.isEmpty() ? player : a.get(rng.nextInt(a.size()));
+    }
 
     // ================================================================== güncelleme
     void update(float dt) {
         menuAnim += dt;
         if (bannerT > 0) bannerT -= dt;
+        if (noticeT > 0) noticeT -= dt;
+        if (net != null) net.poll(dt);
         switch (state) {
             case MENU -> updateMenu();
-            case PLAY -> {
-                if (in.hit(GLFW_KEY_ESCAPE) || in.hit(GLFW_KEY_P)) state = State.PAUSE;
-                else updatePlay(dt);
-            }
-            case LEVELUP -> updateLevelUp(dt);
-            case PAUSE -> {
-                if (in.hit(GLFW_KEY_ESCAPE) || in.hit(GLFW_KEY_P)) state = State.PLAY;
-                if (in.hit(GLFW_KEY_M)) state = State.MENU;
-            }
-            case DEAD, WIN -> {
-                updateFx(dt * 0.5f);
-                cleanup();
-                if (in.hit(GLFW_KEY_ENTER) || in.hit(GLFW_KEY_SPACE)) startGame(champIndex);
-                if (in.hit(GLFW_KEY_M) || in.hit(GLFW_KEY_ESCAPE)) state = State.MENU;
-            }
+            case LOBBY -> updateLobby();
+            default -> updateGame(dt);
         }
+        if (net != null) net.flush(dt);
     }
 
     private void updateMenu() {
@@ -223,29 +357,135 @@ public final class Game {
         if (in.hit(GLFW_KEY_2)) menuSel = 1;
         if (in.hit(GLFW_KEY_3)) menuSel = 2;
         if (in.click(GLFW_MOUSE_BUTTON_LEFT)) {
+            for (int i = 0; i < 3; i++) if (inside(tabRect(i))) menuSel = i;
             for (int i = 0; i < 3; i++) {
-                float[] rc = tabRect(i);
-                if (inside(rc)) {
-                    if (menuSel == i) startGame(i);
-                    menuSel = i;
+                if (!inside(modeRect(i))) continue;
+                if (i == 0) startSolo(menuSel);
+                else if (i == 1) hostLobby();
+                else joinLobby();
+                return;
+            }
+        }
+        if (in.hit(GLFW_KEY_ENTER) || in.hit(GLFW_KEY_SPACE)) startSolo(menuSel);
+        else if (in.hit(GLFW_KEY_H)) hostLobby();
+        else if (in.hit(GLFW_KEY_J)) joinLobby();
+        else if (in.hit(GLFW_KEY_ESCAPE)) glfwSetWindowShouldClose(window, true);
+    }
+
+    private void updateLobby() {
+        in.textMode = true;
+        if (in.hit(GLFW_KEY_ESCAPE)) { leaveToMenu(null); return; }
+        if (in.mod() && in.hit(GLFW_KEY_V)) {
+            String c = window != NULL ? glfwGetClipboardString(window) : null;
+            if (c != null) {
+                c = c.replaceAll("[\\r\\n\\t]", " ").trim();
+                in.typed.append(c, 0, Math.min(c.length(), 48 - in.typed.length()));
+            }
+        }
+        boolean copy = (in.mod() && in.hit(GLFW_KEY_C)) || (in.click(GLFW_MOUSE_BUTTON_LEFT) && inside(copyRect()));
+        if (copy && net != null && net.myCode() != null && window != NULL) {
+            glfwSetClipboardString(window, net.myCode());
+            notice = "Kod kopyalandı: " + net.myCode();
+            noticeT = 2.5f;
+        }
+        if (in.hit(GLFW_KEY_BACKSPACE) && in.typed.length() > 0) in.typed.setLength(in.typed.length() - 1);
+        if (in.hit(GLFW_KEY_ENTER)) {
+            String s = in.typed.toString().trim();
+            if (!s.isEmpty()) {
+                net.submitCode(s);
+                in.typed.setLength(0);
+            } else if (role == Role.HOST) {
+                beginRun();
+            }
+        }
+    }
+
+    private void updateGame(float dt) {
+        boolean mp = role != Role.SOLO;
+        if (in.hit(GLFW_KEY_ESCAPE) || (!mp && in.hit(GLFW_KEY_P))) {
+            if (!mp) {
+                if (state == State.PLAY) { state = State.PAUSE; return; }
+                if (state == State.PAUSE) { state = State.PLAY; return; }
+            } else escMenu = !escMenu;
+        }
+        if (state == State.PAUSE) {
+            if (in.hit(GLFW_KEY_M)) leaveToMenu(null);
+            return;
+        }
+        if (mp && escMenu && in.hit(GLFW_KEY_M)) { leaveToMenu(null); return; }
+
+        updateCamera(dt);
+        updateMouseWorld();
+
+        if (role == Role.CLIENT) {
+            switch (state) {
+                case PLAY -> readLocalInput();
+                case LEVELUP -> localLevelUpInput(dt);
+                case DEAD, WIN -> { if (in.hit(GLFW_KEY_M)) { leaveToMenu(null); return; } }
+                default -> { }
+            }
+            if (net != null) net.clientVisual(dt);
+            return;
+        }
+
+        switch (state) {
+            case PLAY -> {
+                readLocalInput();
+                simulate(dt);
+            }
+            case LEVELUP -> localLevelUpInput(dt);
+            case DEAD, WIN -> {
+                updateFx(dt * 0.5f);
+                cleanup();
+                if (in.hit(GLFW_KEY_ENTER) || in.hit(GLFW_KEY_SPACE)) beginRun();
+                if (in.hit(GLFW_KEY_M)) leaveToMenu(null);
+            }
+            default -> { }
+        }
+    }
+
+    private void readLocalInput() {
+        Player p = player;
+        float mx = 0, mz = 0;
+        if (!escMenu) {
+            if (in.down(GLFW_KEY_W) || in.down(GLFW_KEY_UP)) mz -= 1;
+            if (in.down(GLFW_KEY_S) || in.down(GLFW_KEY_DOWN)) mz += 1;
+            if (in.down(GLFW_KEY_A) || in.down(GLFW_KEY_LEFT)) mx -= 1;
+            if (in.down(GLFW_KEY_D) || in.down(GLFW_KEY_RIGHT)) mx += 1;
+        }
+        float len = (float) Math.sqrt(mx * mx + mz * mz);
+        if (len > 0) { mx /= len; mz /= len; }
+        p.inMx = mx;
+        p.inMz = mz;
+        p.mouseX = mouseX;
+        p.mouseZ = mouseZ;
+        p.lmb = !escMenu && in.mouseDown(GLFW_MOUSE_BUTTON_LEFT);
+        if (escMenu || p.downed) return;
+        for (int i = 0; i < 4; i++) {
+            if (in.hit(CAST_KEYS[i])) {
+                if (role == Role.CLIENT) net.castPressed(i);
+                else p.castReq[i] = true;
+            }
+        }
+    }
+
+    private void simulate(float dt) {
+        time += dt;
+        for (Player p : players) updatePlayer(p, dt);
+        for (Player p : players) {
+            if (p.downed) {
+                Arrays.fill(p.castReq, false);
+                p.champ.anim += dt;
+                continue;
+            }
+            p.champ.update(this, dt);
+            for (int i = 0; i < 4; i++) {
+                if (p.castReq[i]) {
+                    p.castReq[i] = false;
+                    p.champ.tryCast(this, i);
                 }
             }
         }
-        if (in.hit(GLFW_KEY_ENTER) || in.hit(GLFW_KEY_SPACE)) startGame(menuSel);
-        if (in.hit(GLFW_KEY_ESCAPE)) glfwSetWindowShouldClose(window, true);
-    }
-
-    private void updatePlay(float dt) {
-        time += dt;
-        updateCamera(dt);
-        updateMouseWorld();
-        updatePlayer(dt);
-        champ.update(this, dt);
-        if (in.hit(GLFW_KEY_Q)) champ.tryCast(this, 0);
-        // W hareket tuşu olduğu için yetenekler Q E R F'de
-        if (in.hit(GLFW_KEY_E)) champ.tryCast(this, 1);
-        if (in.hit(GLFW_KEY_R)) champ.tryCast(this, 2);
-        if (in.hit(GLFW_KEY_F)) champ.tryCast(this, 3);
         if (state != State.PLAY) return;
         spawnLogic(dt);
         rebuildGrid();
@@ -257,13 +497,14 @@ public final class Game {
         updateZones(dt);
         updateTimed(dt);
         updateOrbs(dt);
+        updateRevive(dt);
         updateFx(dt);
         cleanup();
         if (endTimer > 0) {
             endTimer -= dt;
             if (endTimer <= 0) state = State.WIN;
         }
-        checkLevelUp();
+        if (state == State.PLAY) checkLevelUp();
     }
 
     private void updateCamera(float dt) {
@@ -294,28 +535,39 @@ public final class Game {
         mouseZ = v4.z + (v4b.z - v4.z) * t;
     }
 
-    private void updatePlayer(float dt) {
-        Player p = player;
-        float mx = 0, mz = 0;
-        if (in.down(GLFW_KEY_W) || in.down(GLFW_KEY_UP)) mz -= 1;
-        if (in.down(GLFW_KEY_S) || in.down(GLFW_KEY_DOWN)) mz += 1;
-        if (in.down(GLFW_KEY_A) || in.down(GLFW_KEY_LEFT)) mx -= 1;
-        if (in.down(GLFW_KEY_D) || in.down(GLFW_KEY_RIGHT)) mx += 1;
-        float len = (float) Math.sqrt(mx * mx + mz * mz);
-        p.moving = len > 0;
-        if (p.moving) {
-            mx /= len;
-            mz /= len;
-            float sp = p.moveSpeed();
-            p.x = clampA(p.x + mx * sp * dt);
-            p.z = clampA(p.z + mz * sp * dt);
-            if (p.faceLock <= 0) p.face = turn(p.face, (float) Math.atan2(mx, mz), dt * 14);
-        }
+    private void updatePlayer(Player p, float dt) {
         if (p.faceLock > 0) p.faceLock -= dt;
-        p.heal(p.regen * dt);
         if (p.shieldT > 0) { p.shieldT -= dt; if (p.shieldT <= 0) p.shield = 0; }
         if (p.drT > 0) p.drT -= dt;
         if (p.hurtFlash > 0) p.hurtFlash -= dt;
+        p.moving = false;
+        if (p.downed) { p.moveQueue.clear(); return; }
+        if (p.local) move(p, p.inMx, p.inMz, dt);
+        else {
+            float[] m;
+            while ((m = p.moveQueue.poll()) != null) move(p, m[0], m[1], m[2]);
+        }
+        p.heal(p.regen * dt);
+    }
+
+    private final float[] mv = new float[2];
+
+    private void move(Player p, float mx, float mz, float dt) {
+        if (mx * mx + mz * mz < 1e-6f) return;
+        stepMove(p.x, p.z, mx, mz, p.moveSpeed(), dt, mv);
+        p.x = mv[0];
+        p.z = mv[1];
+        p.moving = true;
+        if (p.faceLock <= 0) p.face = turn(p.face, (float) Math.atan2(mx, mz), dt * 14);
+    }
+
+    /** Saf hareket adımı (istemci tahmini de bunu kullanır). */
+    static float[] stepMove(float x, float z, float mx, float mz, float speed, float dt, float[] out) {
+        float len = (float) Math.sqrt(mx * mx + mz * mz);
+        if (len < 1e-4f) { out[0] = x; out[1] = z; return out; }
+        out[0] = clampA(x + mx / len * speed * dt);
+        out[1] = clampA(z + mz / len * speed * dt);
+        return out;
     }
 
     static float turn(float from, float to, float maxStep) {
@@ -326,11 +578,12 @@ public final class Game {
         return from + Math.signum(d) * maxStep;
     }
 
-    float clampA(float v) { return Math.max(-ARENA + 1, Math.min(ARENA - 1, v)); }
+    static float clampA(float v) { return Math.max(-ARENA + 1, Math.min(ARENA - 1, v)); }
 
     // ------------------------------------------------------------------ doğurma
     private void spawnLogic(float dt) {
-        float rate = Math.min(13f, 0.9f + time / 28f);
+        int n = Math.max(1, players.size());
+        float rate = Math.min(13f + 4 * (n - 1), (0.9f + time / 28f) * (1 + 0.6f * (n - 1)));
         if (boss != null && !boss.dead) rate *= 0.45f;
         spawnAcc += dt * rate;
         while (spawnAcc >= 1) {
@@ -339,16 +592,18 @@ public final class Game {
         }
         if (time >= nextElite) {
             nextElite += 60;
-            spawnAround(time > 200 && rng.nextBoolean() ? EnemyKind.SPITTER : EnemyKind.BRUTE, true);
+            for (int i = 0; i < (n + 1) / 2; i++)
+                spawnAround(time > 200 && rng.nextBoolean() ? EnemyKind.SPITTER : EnemyKind.BRUTE, true);
             banner("Elit düşman yaklaşıyor!", 2.5f, 0xffffd84a);
         }
         if (time >= nextWave) {
             nextWave += 50;
-            int n = (int) Math.min(70, 20 + time / 10);
+            Player a = randomAlive();
+            int cnt = (int) Math.min(70, 20 + time / 10);
             EnemyKind k = time > 120 && rng.nextBoolean() ? EnemyKind.RUNNER : EnemyKind.MINION;
-            for (int i = 0; i < n; i++) {
-                double a = i * Math.PI * 2 / n;
-                spawnEnemy(k, false, player.x + (float) Math.cos(a) * 21, player.z + (float) Math.sin(a) * 21);
+            for (int i = 0; i < cnt; i++) {
+                double ang = i * Math.PI * 2 / cnt;
+                spawnEnemy(k, false, a.x + (float) Math.cos(ang) * 21, a.z + (float) Math.sin(ang) * 21);
             }
             banner("SÜRÜ DALGASI!", 2f, 0xffff7a5a);
         }
@@ -369,21 +624,24 @@ public final class Game {
     }
 
     Enemy spawnAround(EnemyKind k, boolean elite) {
-        double a = rng.nextDouble() * Math.PI * 2;
+        Player a = randomAlive();
+        double ang = rng.nextDouble() * Math.PI * 2;
         float d = 31 + rng.nextFloat() * 5;
-        float x = player.x + (float) Math.cos(a) * d, z = player.z + (float) Math.sin(a) * d;
-        if (Math.abs(x) > ARENA - 2) x = player.x - (float) Math.cos(a) * d;
-        if (Math.abs(z) > ARENA - 2) z = player.z - (float) Math.sin(a) * d;
+        float x = a.x + (float) Math.cos(ang) * d, z = a.z + (float) Math.sin(ang) * d;
+        if (Math.abs(x) > ARENA - 2) x = a.x - (float) Math.cos(ang) * d;
+        if (Math.abs(z) > ARENA - 2) z = a.z - (float) Math.sin(ang) * d;
         return spawnEnemy(k, elite, x, z);
     }
 
     Enemy spawnEnemy(EnemyKind k, boolean elite, float x, float z) {
+        int n = Math.max(1, players.size());
         Enemy e = new Enemy();
+        e.id = nextEnemyId++ & 0xffff;
         e.kind = k;
         e.x = clampA(x);
         e.z = clampA(z);
-        float hpS = 1 + time / 60f * 0.55f;
-        e.maxHp = e.hp = k == EnemyKind.BOSS ? k.hp * (1 + player.level * 0.03f) : k.hp * hpS * (elite ? 10 : 1);
+        float hpS = (1 + time / 60f * 0.55f) * (1 + 0.35f * (n - 1));
+        e.maxHp = e.hp = k == EnemyKind.BOSS ? k.hp * (1 + teamLevel * 0.03f) * (1 + 0.6f * (n - 1)) : k.hp * hpS * (elite ? 10 : 1);
         e.speed = k.speed * (0.9f + rng.nextFloat() * 0.2f) * (1 + Math.min(0.25f, time / 900f)) * (elite ? 0.9f : 1f);
         e.dmg = k.dmg * (1 + time / 240f) * (elite ? 1.6f : 1f);
         e.radius = k.radius * (elite ? 1.4f : 1f);
@@ -429,7 +687,6 @@ public final class Game {
 
     // ------------------------------------------------------------------ düşmanlar
     private void updateEnemies(float dt) {
-        Player p = player;
         for (int i = 0; i < enemies.size(); i++) {
             final Enemy e = enemies.get(i);
             if (e.dead) continue;
@@ -443,6 +700,8 @@ public final class Game {
             if (e.windT > 0) e.windT -= dt;
             e.atkCd -= dt;
 
+            Player p = nearestAlive(e.x, e.z);
+            if (p == null) continue;
             float dx = p.x - e.x, dz = p.z - e.z;
             float dist = (float) Math.sqrt(dx * dx + dz * dz) + 1e-4f;
             float nx = dx / dist, nz = dz / dist;
@@ -464,12 +723,11 @@ public final class Game {
                     e.chargeT -= dt;
                     mvx = e.cdx * 18;
                     mvz = e.cdz * 18;
-                    if (rng.nextFloat() < 0.6f) spark(e.x, 0.5f, e.z, 0xb04aff);
+                    if (rng.nextFloat() < 0.6f) trail(e.x, 0.5f, e.z, 0xb04aff);
                 }
                 bossAI(e, dt);
             }
 
-            // ayrışma (birbirinin içine girmesinler)
             float sx = 0, sz = 0;
             near(e.x, e.z, e.radius + 2.8f, sepBuf);
             for (Enemy o : sepBuf) {
@@ -491,7 +749,7 @@ public final class Game {
             e.kx -= e.kx * kd;
             e.kz -= e.kz * kd;
 
-            // temas hasarı
+            // temas hasarı (en yakın canlı oyuncuya)
             float pr = e.radius + 0.45f;
             float ddx = e.x - p.x, ddz = e.z - p.z, d2 = ddx * ddx + ddz * ddz;
             if (d2 < pr * pr) {
@@ -500,7 +758,7 @@ public final class Game {
                 e.z = p.z + ddz / d * pr;
                 if (e.atkCd <= 0 && e.kind != EnemyKind.SPITTER) {
                     e.atkCd = 0.9f;
-                    hurtPlayer(e.chargeT > 0 ? e.dmg * 1.5f : e.dmg);
+                    hurtPlayer(p, e.chargeT > 0 ? e.dmg * 1.5f : e.dmg);
                 }
             }
         }
@@ -513,16 +771,21 @@ public final class Game {
         e.bossT = 3.4f;
         float dmgS = 1 + time / 240f;
         switch (e.bossPhase) {
-            case 0 -> { // üç yere çarpma
-                for (int i = 0; i < 3; i++) {
-                    final float tx0 = player.x + (i == 0 ? 0 : (rng.nextFloat() - .5f) * 10);
-                    final float tz0 = player.z + (i == 0 ? 0 : (rng.nextFloat() - .5f) * 10);
-                    final float rad = 5f;
-                    telegraph(tx0, tz0, rad, 1.1f + i * 0.25f, 0xff3a6a, () -> {
-                        if (Math.hypot(player.x - tx0, player.z - tz0) < rad) hurtPlayer(35 * dmgS);
-                        explosion(tx0, tz0, rad, 0xb04aff);
-                        shake(0.4f);
-                    });
+            case 0 -> { // her canlı oyuncuya yere çarpma
+                int i = 0;
+                for (Player tp : new ArrayList<>(players)) {
+                    if (tp.downed) continue;
+                    for (int k = 0; k < (players.size() > 1 ? 2 : 3); k++, i++) {
+                        final float tx0 = tp.x + (k == 0 ? 0 : (rng.nextFloat() - .5f) * 10);
+                        final float tz0 = tp.z + (k == 0 ? 0 : (rng.nextFloat() - .5f) * 10);
+                        final float rad = 5f;
+                        telegraph(tx0, tz0, rad, 1.1f + k * 0.25f, 0xff3a6a, () -> {
+                            for (Player q : players)
+                                if (!q.downed && Math.hypot(q.x - tx0, q.z - tz0) < rad) hurtPlayer(q, 35 * dmgS);
+                            explosion(tx0, tz0, rad, 0xb04aff);
+                            shake(0.4f);
+                        });
+                    }
                 }
             }
             case 1 -> { // çağırma + radyal tükürük
@@ -540,8 +803,9 @@ public final class Game {
                 e.windT = 0.8f;
                 e.flash = 0.8f;
                 later(0.8f, () -> {
-                    if (e.dead) return;
-                    float dx = player.x - e.x, dz = player.z - e.z;
+                    Player t = nearestAlive(e.x, e.z);
+                    if (e.dead || t == null) return;
+                    float dx = t.x - e.x, dz = t.z - e.z;
                     float l = (float) Math.max(0.01, Math.hypot(dx, dz));
                     e.cdx = dx / l;
                     e.cdz = dz / l;
@@ -553,14 +817,13 @@ public final class Game {
     }
 
     void enemyShoot(float x, float z, float dx, float dz, float speed, float dmg) {
-        Projectile p = shoot(ProjKind.SPIT, x, z, dx, dz, speed, dmg, 22, 0.35f, 0x8cff5a);
+        Projectile p = shoot(null, ProjKind.SPIT, x, z, dx, dz, speed, dmg, 22, 0.35f, 0x8cff5a);
         p.enemy = true;
         p.y = 0.9f;
     }
 
-    void hurtPlayer(float amt) {
-        if (state != State.PLAY) return;
-        Player p = player;
+    void hurtPlayer(Player p, float amt) {
+        if (state != State.PLAY || p.downed) return;
         amt *= 1 - Math.min(0.6f, p.armor);
         if (p.drT > 0) amt *= 1 - p.dr;
         if (p.shield > 0) {
@@ -572,35 +835,67 @@ public final class Game {
         p.hp -= amt;
         p.hurtFlash = 0.15f;
         p.lastHit = time;
-        shake(0.18f);
+        shakeFor(p, 0.18f);
         if (p.hp <= 0) {
             p.hp = 0;
-            state = State.DEAD;
-            burst(p.x, 1, p.z, 40, champ.color, 6);
+            p.downed = true;
+            p.reviveT = 0;
+            p.shield = 0;
+            burst(p.x, 1, p.z, 30, p.champ.color, 5);
+            if (allDown()) {
+                state = State.DEAD;
+            } else {
+                banner(p.displayName() + " düştü! Yanına gidip kaldırın.", 3f, 0xffff4a5a);
+            }
+        }
+    }
+
+    private void updateRevive(float dt) {
+        for (Player p : players) {
+            if (!p.downed) continue;
+            boolean helper = false;
+            for (Player q : players) {
+                if (q == p || q.downed) continue;
+                float dx = q.x - p.x, dz = q.z - p.z;
+                if (dx * dx + dz * dz < REVIVE_RANGE * REVIVE_RANGE) { helper = true; break; }
+            }
+            if (helper) {
+                p.reviveT += dt;
+                if (rng.nextFloat() < dt * 20) spark(p.x + rng.nextFloat() - .5f, 0.5f, p.z + rng.nextFloat() - .5f, 0x5ad17a);
+                if (p.reviveT >= REVIVE_TIME) {
+                    p.downed = false;
+                    p.hp = p.maxHp * 0.4f;
+                    p.reviveT = 0;
+                    ringFx(p.x, p.z, 0.5f, 3f, 0.5f, 0x5ad17a);
+                    burst(p.x, 1, p.z, 16, 0x5ad17a, 3);
+                    banner(p.displayName() + " ayağa kalktı!", 2f, 0xff5ad17a);
+                }
+            } else p.reviveT = Math.max(0, p.reviveT - dt * 0.5f);
         }
     }
 
     // ------------------------------------------------------------------ hasar
-    void damage(Enemy e, float amt, boolean canCrit) { damage(e, amt, canCrit, true); }
+    void damage(Player owner, Enemy e, float amt, boolean canCrit) { damage(owner, e, amt, canCrit, true); }
 
-    void damage(Enemy e, float amt, boolean canCrit, boolean showText) {
+    void damage(Player owner, Enemy e, float amt, boolean canCrit, boolean showText) {
         if (e.dead) return;
-        boolean crit = canCrit && rng.nextFloat() < player.crit;
-        float d = amt * player.dmgMult * (crit ? 2f : 1f);
+        float critCh = owner != null ? owner.crit : 0, mult = owner != null ? owner.dmgMult : 1;
+        boolean crit = canCrit && rng.nextFloat() < critCh;
+        float d = amt * mult * (crit ? 2f : 1f);
         e.hp -= d;
         e.flash = 0.1f;
         if (showText) popText(e.x, 1.6f + e.radius, e.z, String.valueOf(Math.round(d)), crit ? 0xffffd84a : 0xffffffff, crit ? 26 : 18);
-        if (e.hp <= 0) kill(e);
+        if (e.hp <= 0) kill(owner, e);
     }
 
-    void execute(Enemy e) {
+    void execute(Player owner, Enemy e) {
         if (e.dead) return;
         popText(e.x, 2.2f, e.z, "İNFAZ!", 0xffe0b23a, 26);
         e.hp = 0;
-        kill(e);
+        kill(owner, e);
     }
 
-    void kill(Enemy e) {
+    void kill(Player owner, Enemy e) {
         if (e.dead) return;
         e.dead = true;
         kills++;
@@ -620,19 +915,19 @@ public final class Game {
             } else if (rng.nextFloat() < 0.005f) dropOrb(e.x, e.z, 0, Orb.HEAL);
             else if (rng.nextFloat() < 0.0015f) dropOrb(e.x, e.z, 0, Orb.MAGNET);
         }
-        champ.onKill(this, e);
+        if (owner != null && owner.champ != null) owner.champ.onKill(this, e);
     }
 
-    int aoe(float x, float z, float rad, float dmg, Consumer<Enemy> after) { return aoe(x, z, rad, dmg, after, true); }
+    int aoe(Player owner, float x, float z, float rad, float dmg, Consumer<Enemy> after) { return aoe(owner, x, z, rad, dmg, after, true); }
 
-    int aoe(float x, float z, float rad, float dmg, Consumer<Enemy> after, boolean showText) {
+    int aoe(Player owner, float x, float z, float rad, float dmg, Consumer<Enemy> after, boolean showText) {
         near(x, z, rad + 3, aoeBuf);
         int n = 0;
         for (Enemy e : aoeBuf) {
             if (e.dead) continue;
             float dx = e.x - x, dz = e.z - z, rr = rad + e.radius * 0.6f;
             if (dx * dx + dz * dz <= rr * rr) {
-                damage(e, dmg, true, showText);
+                damage(owner, e, dmg, true, showText);
                 if (after != null) after.accept(e);
                 n++;
             }
@@ -649,38 +944,39 @@ public final class Game {
     }
 
     // ------------------------------------------------------------------ şampiyon API'si
-    /** Temel saldırı hedefi: sol tık basılıysa fare, değilse en yakın düşman. */
-    boolean aim(float range) {
-        Player p = player;
-        if (in.mouseDown(GLFW_MOUSE_BUTTON_LEFT)) {
-            aimX = mouseX;
-            aimZ = mouseZ;
+    /** Temel saldırı hedefi: sol tık basılıysa fare, değilse en yakın düşman. → p.aimX/aimZ */
+    boolean aim(Player p, float range) {
+        if (p.lmb) {
+            p.aimX = p.mouseX;
+            p.aimZ = p.mouseZ;
         } else {
             Enemy e = nearest(p.x, p.z, range);
             if (e == null) return false;
-            aimX = e.x;
-            aimZ = e.z;
+            p.aimX = e.x;
+            p.aimZ = e.z;
         }
-        p.face = (float) Math.atan2(aimX - p.x, aimZ - p.z);
+        p.face = (float) Math.atan2(p.aimX - p.x, p.aimZ - p.z);
         p.faceLock = 0.35f;
         return true;
     }
 
-    /** Fare noktasını oyuncudan en fazla maxDist uzaklığa kısıtlar → tx, tz. */
-    void target(float maxDist) {
-        float dx = mouseX - player.x, dz = mouseZ - player.z;
+    /** Fare noktasını oyuncudan en fazla maxDist uzaklığa kısıtlar → p.tx, p.tz. */
+    void target(Player p, float maxDist) {
+        float dx = p.mouseX - p.x, dz = p.mouseZ - p.z;
         float d = (float) Math.hypot(dx, dz);
         if (d > maxDist) { dx *= maxDist / d; dz *= maxDist / d; }
-        tx = clampA(player.x + dx);
-        tz = clampA(player.z + dz);
+        p.tx = clampA(p.x + dx);
+        p.tz = clampA(p.z + dz);
     }
 
-    Projectile shoot(ProjKind k, float x, float z, float dx, float dz, float speed, float dmg, float range, float radius, int color) {
+    Projectile shoot(Player owner, ProjKind k, float x, float z, float dx, float dz, float speed, float dmg, float range, float radius, int color) {
         float len = (float) Math.hypot(dx, dz);
         if (len < 1e-4f) { dx = 0; dz = 1; len = 1; }
         dx /= len;
         dz /= len;
         Projectile p = new Projectile();
+        p.id = nextProjId++ & 0xffff;
+        p.owner = owner;
         p.kind = k;
         p.x = x + dx * 0.6f;
         p.z = z + dz * 0.6f;
@@ -702,12 +998,28 @@ public final class Game {
         telegraphs.add(tg);
     }
 
-    void shake(float a) { shakeAmt = Math.max(shakeAmt, a); }
+    // ------------------------------------------------------------------ efektler (host'ta ağa da yazılır)
+    private boolean rec() { return role == Role.HOST && net != null && net.hasPeers(); }
 
-    void banner(String s, float t, int argb) { banner = s; bannerT = t; bannerColor = argb; }
+    void shake(float a) {
+        shakeAmt = Math.max(shakeAmt, a);
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.SHAKE); e.a = a; e.n = -1; fxEvents.add(e); }
+    }
 
-    // ------------------------------------------------------------------ efektler
+    void shakeFor(Player p, float a) {
+        if (p.local) shakeAmt = Math.max(shakeAmt, a);
+        else if (rec()) { FxEvent e = new FxEvent(FxEvent.SHAKE); e.a = a; e.n = p.id; fxEvents.add(e); }
+    }
+
+    void banner(String s, float t, int argb) {
+        banner = s;
+        bannerT = t;
+        bannerColor = argb;
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.BANNER); e.s = s; e.a = t; e.color = argb; fxEvents.add(e); }
+    }
+
     void burst(float x, float y, float z, int n, int color, float speed) {
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.BURST); e.x = x; e.y = y; e.z = z; e.n = n; e.color = color; e.a = speed; fxEvents.add(e); }
         for (int i = 0; i < n && particles.size() < 3000; i++) {
             Particle p = new Particle();
             p.x = x; p.y = y; p.z = z;
@@ -725,6 +1037,12 @@ public final class Game {
     }
 
     void spark(float x, float y, float z, int color) {
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.SPARK); e.x = x; e.y = y; e.z = z; e.color = color; fxEvents.add(e); }
+        trail(x, y, z, color);
+    }
+
+    /** Ağa gönderilmeyen küçük kıvılcım (mermi izleri: istemci kendisi üretir). */
+    void trail(float x, float y, float z, int color) {
         if (particles.size() >= 3000) return;
         Particle p = new Particle();
         p.x = x; p.y = y; p.z = z;
@@ -739,6 +1057,7 @@ public final class Game {
     }
 
     void ringFx(float x, float z, float r0, float r1, float life, int color) {
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.RING); e.x = x; e.z = z; e.a = r0; e.b = r1; e.c = life; e.color = color; fxEvents.add(e); }
         RingFx f = new RingFx();
         f.x = x; f.z = z; f.r0 = r0; f.r1 = r1; f.life = f.max = life; f.color = color;
         rings.add(f);
@@ -751,6 +1070,7 @@ public final class Game {
     }
 
     void popText(float x, float y, float z, String s, int argb, float size) {
+        if (rec()) { FxEvent e = new FxEvent(FxEvent.TEXT); e.x = x; e.y = y; e.z = z; e.s = s; e.color = argb; e.a = size; fxEvents.add(e); }
         if (texts.size() > 140) return;
         DmgText t = new DmgText();
         t.x = x + (rng.nextFloat() - .5f) * 0.6f;
@@ -763,63 +1083,72 @@ public final class Game {
         texts.add(t);
     }
 
-    // ------------------------------------------------------------------ genel silahlar
-    float auraRadius() { return (2.6f + 0.4f * lvl("aura")) * player.area; }
+    void projectileTrail(Projectile p) {
+        if (p.kind == ProjKind.MEGA) {
+            for (int i = 0; i < 2; i++) trail(p.x - p.vx * 0.03f, p.y, p.z - p.vz * 0.03f, rng.nextBoolean() ? 0xff7a2a : 0xffd84a);
+        } else if (p.kind == ProjKind.ROCKET && rng.nextFloat() < 0.6f) trail(p.x, p.y, p.z, 0x9aa3ad);
+        else if (p.kind == ProjKind.ZAP && rng.nextFloat() < 0.8f) trail(p.x, p.y, p.z, 0x7ff9ff);
+    }
+
+    // ------------------------------------------------------------------ genel silahlar (oyuncu başına)
+    float auraRadius(Player p) { return (2.6f + 0.4f * p.lvl("aura")) * p.area; }
 
     private void updateWeapons(float dt) {
-        Player p = player;
-        int bl = lvl("blades");
-        if (bl > 0) {
-            int n = 1 + bl;
-            float rad = 3.0f * p.area;
-            bladeAngle += dt * 3.2f;
-            float dmg = 10 + 5 * bl;
-            for (int k = 0; k < n; k++) {
-                double a = bladeAngle + k * Math.PI * 2 / n;
-                float bx = p.x + (float) Math.cos(a) * rad, bz = p.z + (float) Math.sin(a) * rad;
-                near(bx, bz, 4, bladeBuf);
-                for (Enemy e : bladeBuf) {
-                    if (e.dead || e.bladeCd > 0) continue;
-                    float dx = e.x - bx, dz = e.z - bz, rr = 0.7f + e.radius;
-                    if (dx * dx + dz * dz < rr * rr) {
-                        damage(e, dmg, true);
-                        e.bladeCd = 0.45f;
-                        knock(e, p.x, p.z, 4);
+        for (Player p : players) {
+            if (p.downed) continue;
+            int bl = p.lvl("blades");
+            if (bl > 0) {
+                int n = 1 + bl;
+                float rad = 3.0f * p.area;
+                p.bladeAngle += dt * 3.2f;
+                float dmg = 10 + 5 * bl;
+                for (int k = 0; k < n; k++) {
+                    double a = p.bladeAngle + k * Math.PI * 2 / n;
+                    float bx = p.x + (float) Math.cos(a) * rad, bz = p.z + (float) Math.sin(a) * rad;
+                    near(bx, bz, 4, bladeBuf);
+                    for (Enemy e : bladeBuf) {
+                        if (e.dead || e.bladeCd > 0) continue;
+                        float dx = e.x - bx, dz = e.z - bz, rr = 0.7f + e.radius;
+                        if (dx * dx + dz * dz < rr * rr) {
+                            damage(p, e, dmg, true);
+                            e.bladeCd = 0.45f;
+                            knock(e, p.x, p.z, 4);
+                        }
                     }
                 }
             }
-        }
-        int cl = lvl("chain");
-        if (cl > 0) {
-            chainTimer -= dt * p.asMult;
-            if (chainTimer <= 0) {
-                chainTimer = Math.max(0.9f, 2.6f - 0.3f * cl);
-                Enemy cur = nearest(p.x, p.z, 14);
-                if (cur != null) {
-                    HashSet<Enemy> hit = new HashSet<>();
-                    float px = p.x, pz = p.z, dmg = 22 + 9 * cl;
-                    int jumps = 2 + cl;
-                    for (int j = 0; j <= jumps && cur != null; j++) {
-                        lightning(px, pz, cur.x, cur.z);
-                        hit.add(cur);
-                        damage(cur, dmg, true);
-                        burst(cur.x, 1, cur.z, 3, 0xbfe6ff, 3);
-                        px = cur.x;
-                        pz = cur.z;
-                        cur = nearestExcluding(px, pz, 7, hit);
+            int cl = p.lvl("chain");
+            if (cl > 0) {
+                p.chainTimer -= dt * p.asMult;
+                if (p.chainTimer <= 0) {
+                    p.chainTimer = Math.max(0.9f, 2.6f - 0.3f * cl);
+                    Enemy cur = nearest(p.x, p.z, 14);
+                    if (cur != null) {
+                        HashSet<Enemy> hit = new HashSet<>();
+                        float px = p.x, pz = p.z, dmg = 22 + 9 * cl;
+                        int jumps = 2 + cl;
+                        for (int j = 0; j <= jumps && cur != null; j++) {
+                            lightning(px, pz, cur.x, cur.z);
+                            hit.add(cur);
+                            damage(p, cur, dmg, true);
+                            burst(cur.x, 1, cur.z, 3, 0xbfe6ff, 3);
+                            px = cur.x;
+                            pz = cur.z;
+                            cur = nearestExcluding(px, pz, 7, hit);
+                        }
                     }
                 }
             }
-        }
-        int au = lvl("aura");
-        if (au > 0) {
-            auraTimer -= dt;
-            if (auraTimer <= 0) {
-                auraTimer = 0.3f;
-                aoe(p.x, p.z, auraRadius(), 3 + 2 * au, e -> {
-                    e.slow = Math.max(e.slow, 0.3f);
-                    e.slowT = Math.max(e.slowT, 0.4f);
-                }, false);
+            int au = p.lvl("aura");
+            if (au > 0) {
+                p.auraTimer -= dt;
+                if (p.auraTimer <= 0) {
+                    p.auraTimer = 0.3f;
+                    aoe(p, p.x, p.z, auraRadius(p), 3 + 2 * au, e -> {
+                        e.slow = Math.max(e.slow, 0.3f);
+                        e.slowT = Math.max(e.slowT, 0.4f);
+                    }, false);
+                }
             }
         }
     }
@@ -837,7 +1166,6 @@ public final class Game {
 
     // ------------------------------------------------------------------ mermiler
     private void updateProjectiles(float dt) {
-        Player pl = player;
         for (int i = 0; i < projectiles.size(); i++) {
             Projectile p = projectiles.get(i);
             if (p.dead) continue;
@@ -846,12 +1174,8 @@ public final class Game {
                 float sp = (float) Math.hypot(p.vx, p.vz), ns = Math.min(50, sp + dt * 22);
                 p.vx *= ns / sp;
                 p.vz *= ns / sp;
-                burst(p.x - p.vx * 0.03f, p.y, p.z - p.vz * 0.03f, 2, rng.nextBoolean() ? 0xff7a2a : 0xffd84a, 1.5f);
-            } else if (p.kind == ProjKind.ROCKET && rng.nextFloat() < 0.6f) {
-                spark(p.x, p.y, p.z, 0x9aa3ad);
-            } else if (p.kind == ProjKind.ZAP && rng.nextFloat() < 0.8f) {
-                spark(p.x, p.y, p.z, 0x7ff9ff);
             }
+            projectileTrail(p);
             float stepX = p.vx * dt, stepZ = p.vz * dt;
             p.x += stepX;
             p.z += stepZ;
@@ -863,11 +1187,15 @@ public final class Game {
                 continue;
             }
             if (p.enemy) {
-                float dx = p.x - pl.x, dz = p.z - pl.z, rr = p.radius + 0.5f;
-                if (dx * dx + dz * dz < rr * rr) {
-                    hurtPlayer(p.dmg);
-                    burst(p.x, p.y, p.z, 6, p.color, 3);
-                    p.dead = true;
+                for (Player pl : players) {
+                    if (pl.downed) continue;
+                    float dx = p.x - pl.x, dz = p.z - pl.z, rr = p.radius + 0.5f;
+                    if (dx * dx + dz * dz < rr * rr) {
+                        hurtPlayer(pl, p.dmg);
+                        burst(p.x, p.y, p.z, 6, p.color, 3);
+                        p.dead = true;
+                        break;
+                    }
                 }
                 continue;
             }
@@ -891,7 +1219,7 @@ public final class Game {
             explosion(p.x, p.z, p.splash * 0.6f, 0xff7a2a);
         }
         explosion(p.x, p.z, p.splash, p.kind == ProjKind.MEGA ? 0xd8344a : 0xff8ad8);
-        aoe(p.x, p.z, p.splash, dmg, null);
+        aoe(p.owner, p.x, p.z, p.splash, dmg, null);
         p.dead = true;
     }
 
@@ -907,7 +1235,7 @@ public final class Game {
             d += p.markBonus;
             burst(e.x, 1.2f, e.z, 8, 0xffe08a, 4);
         }
-        damage(e, d, true);
+        damage(p.owner, e, d, true);
         if (p.slow > 0) { e.slow = Math.max(e.slow, p.slow); e.slowT = Math.max(e.slowT, p.slowT); }
         if (p.root > 0) e.rootT = Math.max(e.rootT, p.root);
         if (p.mark) e.markT = 4f;
@@ -935,7 +1263,7 @@ public final class Game {
             if (trig) {
                 t.dead = true;
                 final float root = t.root;
-                aoe(t.x, t.z, t.radius, t.dmg, e -> e.rootT = Math.max(e.rootT, root));
+                aoe(t.owner, t.x, t.z, t.radius, t.dmg, e -> e.rootT = Math.max(e.rootT, root));
                 explosion(t.x, t.z, t.radius, 0xff6a2a);
                 shake(0.15f);
             }
@@ -984,7 +1312,7 @@ public final class Game {
         }
     }
 
-    // ------------------------------------------------------------------ küreler
+    // ------------------------------------------------------------------ küreler (takım tecrübesi)
     void dropOrb(float x, float z, float value, int type) {
         if (type == Orb.XP && orbs.size() > 700) {
             Orb o = orbs.get(rng.nextInt(orbs.size()));
@@ -996,13 +1324,13 @@ public final class Game {
     }
 
     private void updateOrbs(float dt) {
-        Player p = player;
-        float pr2 = p.pickup * p.pickup;
         for (Orb o : orbs) {
             if (o.value < 0) continue;
             o.age += dt;
+            Player p = nearestAlive(o.x, o.z);
+            if (p == null) continue;
             float dx = p.x - o.x, dz = p.z - o.z, d2 = dx * dx + dz * dz;
-            if (!o.magnet && d2 < pr2) o.magnet = true;
+            if (!o.magnet && d2 < p.pickup * p.pickup) o.magnet = true;
             if (o.magnet) {
                 float d = (float) Math.sqrt(d2) + 1e-4f;
                 o.speed = Math.min(40, o.speed + dt * 45);
@@ -1010,17 +1338,16 @@ public final class Game {
                 o.x += dx / d * step;
                 o.z += dz / d * step;
                 if (d < 0.7f) {
-                    collect(o);
+                    collect(p, o);
                     o.value = -1;
                 }
             }
         }
     }
 
-    private void collect(Orb o) {
-        Player p = player;
+    private void collect(Player p, Orb o) {
         switch (o.type) {
-            case Orb.XP -> p.xp += o.value;
+            case Orb.XP -> teamXp += o.value;
             case Orb.HEAL -> {
                 p.heal(p.maxHp * 0.3f);
                 popText(p.x, 2.4f, p.z, "+CAN", 0xff5ad17a, 24);
@@ -1034,7 +1361,18 @@ public final class Game {
     }
 
     // ------------------------------------------------------------------ efekt güncelle
-    private void updateFx(float dt) {
+    void updateFx(float dt) {
+        updateFxVisual(dt);
+        for (Beam b : beams) {
+            if (!b.fired) {
+                b.delay -= dt;
+                if (b.delay <= 0) { b.fired = true; fireBeam(b); }
+            }
+        }
+    }
+
+    /** Sadece görsel (istemci de kullanır): parçacık, halka, yazı, ışın ömrü. */
+    void updateFxVisual(float dt) {
         for (Particle p : particles) {
             p.life -= dt;
             p.x += p.vx * dt;
@@ -1046,10 +1384,13 @@ public final class Game {
         for (RingFx f : rings) f.life -= dt;
         for (DmgText t : texts) { t.life -= dt; t.y += dt * 1.6f; }
         for (Beam b : beams) {
-            if (!b.fired) {
-                b.delay -= dt;
-                if (b.delay <= 0) { b.fired = true; fireBeam(b); }
-            } else b.life -= dt;
+            if (b.fired) b.life -= dt;
+            else if (role == Role.CLIENT) b.delay -= dt;
+        }
+        if (role == Role.CLIENT) {
+            particles.removeIf(p -> p.life <= 0);
+            rings.removeIf(f -> f.life <= 0);
+            texts.removeIf(t -> t.life <= 0);
         }
     }
 
@@ -1062,7 +1403,7 @@ public final class Game {
             float px = b.x1 + dx * t, pz = b.z1 + dz * t;
             float ex = e.x - px, ez = e.z - pz, rr = b.width / 2 + e.radius;
             if (ex * ex + ez * ez < rr * rr) {
-                damage(e, b.dmg, true);
+                damage(b.owner, e, b.dmg, true);
                 if (b.mark) e.markT = 4f;
             }
         }
@@ -1088,52 +1429,64 @@ public final class Game {
         swords.removeIf(s -> s.dead);
     }
 
-    // ------------------------------------------------------------------ seviye atlama
+    // ------------------------------------------------------------------ seviye atlama (herkes kendi kartını seçer)
     private void checkLevelUp() {
-        Player p = player;
-        while (p.xp >= p.xpNext) {
-            p.xp -= p.xpNext;
-            p.level++;
-            p.xpNext = xpFor(p.level);
+        while (teamXp >= xpNext) {
+            teamXp -= xpNext;
+            teamLevel++;
+            xpNext = xpFor(teamLevel);
             pendingLevels++;
         }
         if (pendingLevels > 0 && state == State.PLAY) openLevelUp();
     }
 
     private void openLevelUp() {
-        List<Upgrade> pool = new ArrayList<>();
-        for (Upgrade u : Upgrade.generic()) if (lvl(u.id) < u.max) pool.add(upgradeIndex.get(u.id));
-        for (Upgrade u : champ.special()) if (lvl(u.id) < u.max) pool.add(upgradeIndex.get(u.id));
-        Collections.shuffle(pool, rng);
-        choices = new ArrayList<>(pool.subList(0, Math.min(3, pool.size())));
-        if (choices.isEmpty()) {
-            Upgrade f = Upgrade.fallback();
-            upgradeIndex.put(f.id, f);
-            choices.add(f);
+        pickRound++;
+        for (Player p : players) {
+            List<Upgrade> pool = new ArrayList<>();
+            for (Upgrade u : p.upIndex.values()) if (u.max < 999 && p.lvl(u.id) < u.max) pool.add(u);
+            Collections.shuffle(pool, rng);
+            p.choices = new ArrayList<>(pool.subList(0, Math.min(3, pool.size())));
+            if (p.choices.isEmpty()) {
+                Upgrade f = Upgrade.fallback();
+                p.upIndex.put(f.id, f);
+                p.choices.add(f);
+            }
+            p.picked = false;
+            burst(p.x, 1, p.z, 20, 0xffd84a, 4);
         }
         state = State.LEVELUP;
         levelUpDelay = 0.3f;
-        burst(player.x, 1, player.z, 20, 0xffd84a, 4);
     }
 
-    private void updateLevelUp(float dt) {
+    void choose(Player p, int pick) {
+        if (state != State.LEVELUP || p.picked || pick < 0 || pick >= p.choices.size()) return;
+        Upgrade u = p.choices.get(pick);
+        p.ups.merge(u.id, 1, Integer::sum);
+        u.apply.accept(p);
+        p.picked = true;
+        finishPickIfDone();
+    }
+
+    private void finishPickIfDone() {
+        for (Player q : players) if (!q.picked) return;
+        pendingLevels--;
+        state = State.PLAY;
+        if (pendingLevels > 0) openLevelUp();
+    }
+
+    private void localLevelUpInput(float dt) {
         if (levelUpDelay > 0) { levelUpDelay -= dt; return; }
+        if (player.picked || escMenu) return;
         int pick = -1;
         if (in.hit(GLFW_KEY_1)) pick = 0;
         if (in.hit(GLFW_KEY_2)) pick = 1;
         if (in.hit(GLFW_KEY_3)) pick = 2;
         if (in.click(GLFW_MOUSE_BUTTON_LEFT))
-            for (int i = 0; i < choices.size(); i++) if (inside(cardRect(i))) pick = i;
-        if (pick >= 0 && pick < choices.size()) choose(pick);
-    }
-
-    void choose(int pick) {
-        Upgrade u = choices.get(pick);
-        upLevels.merge(u.id, 1, Integer::sum);
-        u.apply.accept(this);
-        pendingLevels--;
-        state = State.PLAY;
-        if (pendingLevels > 0) openLevelUp();
+            for (int i = 0; i < player.choices.size(); i++) if (inside(cardRect(i))) pick = i;
+        if (pick < 0 || pick >= player.choices.size()) return;
+        if (role == Role.CLIENT) net.clientPick(pick);
+        else choose(player, pick);
     }
 
     private float[] cardRect(int i) {
@@ -1143,8 +1496,15 @@ public final class Game {
 
     private float[] tabRect(int i) {
         float w = 230, h = 56, gap = 20, total = 3 * w + 2 * gap;
+        return new float[]{(winW - total) / 2 + i * (w + gap), winH - 196, w, h};
+    }
+
+    private float[] modeRect(int i) {
+        float w = 250, h = 50, gap = 20, total = 3 * w + 2 * gap;
         return new float[]{(winW - total) / 2 + i * (w + gap), winH - 120, w, h};
     }
+
+    private float[] copyRect() { return new float[]{500, 178, 130, 40}; }
 
     private boolean inside(float[] rc) {
         return in.mx >= rc[0] && in.mx <= rc[0] + rc[2] && in.my >= rc[1] && in.my <= rc[1] + rc[3];
@@ -1160,39 +1520,47 @@ public final class Game {
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-        if (state == State.MENU) {
+        if (state == State.MENU || state == State.LOBBY) {
             renderMenu3D();
             ui.begin(winW, winH);
-            renderMenuUi();
+            if (state == State.MENU) renderMenuUi();
+            else renderLobbyUi();
+            renderNotice();
             return;
         }
         renderWorld();
         ui.begin(winW, winH);
         renderWorldUi();
         renderHud();
+        boolean mp = role != Role.SOLO;
         switch (state) {
             case LEVELUP -> renderLevelUp();
             case PAUSE -> renderOverlay("DURAKLATILDI", "ESC / P: devam    M: ana menü", 0xffffffff);
-            case DEAD -> renderOverlay("YENİLDİN", stats() + "\nENTER: tekrar dene    M: ana menü", 0xffff4a5a);
-            case WIN -> renderOverlay("ZAFER!", stats() + "\nENTER: tekrar oyna    M: ana menü", 0xffffd84a);
+            case DEAD -> renderOverlay("YENİLDİNİZ", stats() + "\n" + endHint(), 0xffff4a5a);
+            case WIN -> renderOverlay("ZAFER!", stats() + "\n" + endHint(), 0xffffd84a);
             default -> { }
         }
+        if (mp && escMenu && state != State.DEAD && state != State.WIN)
+            renderOverlay("MENÜ", "Oyun arkada devam ediyor!\nESC: geri dön    M: oyundan çık", 0xffffffff);
+        renderNotice();
+    }
+
+    private String endHint() {
+        if (role == Role.CLIENT) return "Host yeniden başlatabilir    M: ana menü";
+        return "ENTER: tekrar oyna" + (role == Role.HOST ? " (herkesle)" : "") + "    M: ana menü";
     }
 
     private String stats() {
-        return String.format("Süre %02d:%02d   •   Öldürme %d   •   Seviye %d", (int) time / 60, (int) time % 60, kills, player.level);
+        return String.format("Süre %02d:%02d   •   Öldürme %d   •   Seviye %d", (int) time / 60, (int) time % 60, kills, teamLevel);
     }
 
     private void renderWorld() {
-        Player p = player;
         r.begin(proj, view, camPos, ARENA, FOG);
 
-        // zemin
         r.mode = 1;
         r.draw(r.plane, r.at(camX, 0, camZ).scale(260, 1, 260), 0xffffff);
         r.mode = 0;
 
-        // arena sınır direkleri + dekor
         for (float t = -ARENA; t <= ARENA; t += 8) {
             borderPost(t, -ARENA);
             borderPost(t, ARENA);
@@ -1204,15 +1572,27 @@ public final class Game {
         // gölgeler ve yer efektleri (derinlik yazmadan)
         glDepthMask(false);
         r.alpha = 0.35f;
-        shadow(p.x, p.z, 0.8f);
+        for (Player p : players) shadow(p.x, p.z, 0.8f);
         for (Enemy e : enemies) if (visible(e.x, e.z)) shadow(e.x, e.z, e.radius * 1.1f);
-        int au = lvl("aura");
-        if (au > 0) {
-            float rad = auraRadius();
+        for (Player p : players) {
+            int au = p.lvl("aura");
+            if (au <= 0 || p.downed) continue;
+            float rad = auraRadius(p);
             r.alpha = 0.10f;
             r.draw(r.disc, r.at(p.x, 0.03f, p.z).scale(rad * 2, 1, rad * 2), 0x7fd8ff, 1f);
             r.alpha = 0.45f;
             r.draw(r.ring, r.at(p.x, 0.04f, p.z).rotateY(menuAnim).scale(rad * 2, 1, rad * 2), 0x7fd8ff, 1f);
+        }
+        for (Player p : players) {
+            if (!p.downed) continue;
+            float pulse = 0.5f + 0.5f * (float) Math.sin(menuAnim * 6);
+            r.alpha = 0.35f + 0.3f * pulse;
+            r.draw(r.ring, r.at(p.x, 0.05f, p.z).scale(REVIVE_RANGE * 2, 1, REVIVE_RANGE * 2), 0xff3a4a, 1f);
+            float k = p.reviveT / REVIVE_TIME;
+            if (k > 0) {
+                r.alpha = 0.45f;
+                r.draw(r.disc, r.at(p.x, 0.04f, p.z).scale(REVIVE_RANGE * 2 * k, 1, REVIVE_RANGE * 2 * k), 0x5ad17a, 1f);
+            }
         }
         for (Zone zn : zones) {
             float k = zn.life / zn.max;
@@ -1257,6 +1637,7 @@ public final class Game {
                     r.draw(r.cube, r.at(o.x, bob + 0.1f, o.z).rotateY(o.age * 2).translate(-0.18f, 0, 0).scale(0.3f, 0.5f, 0.3f), 0xff3a3a, 0.5f);
                     r.draw(r.cube, r.at(o.x, bob + 0.1f, o.z).rotateY(o.age * 2).translate(0.18f, 0, 0).scale(0.3f, 0.5f, 0.3f), 0x3a6aff, 0.5f);
                 }
+                default -> { }
             }
         }
 
@@ -1273,22 +1654,31 @@ public final class Game {
             r.draw(r.sphere, r.at(t.x, 0.42f, t.z).scale(0.2f), armed && ((int) (t.age * 6)) % 2 == 0 ? 0xff2a2a : 0x802020, 1f);
         }
 
-        // düşmanlar
         for (Enemy e : enemies) if (visible(e.x, e.z)) renderEnemy(e);
 
-        // oyuncu
-        base.translation(p.x, 0, p.z).rotateY(p.face);
-        r.flash = p.hurtFlash > 0 ? 0.6f : 0;
-        champ.render(r, base, champ.anim, p.moving);
-        r.flash = 0;
+        // oyuncular
+        for (Player p : players) {
+            if (p.downed) {
+                base.translation(p.x, 0.35f, p.z).rotateY(p.face).rotateX(-Champion.HALF_PI);
+                r.flash = 0.35f;
+                p.champ.render(r, base, p.champ.anim, false);
+            } else {
+                base.translation(p.x, 0, p.z).rotateY(p.face);
+                r.flash = p.hurtFlash > 0 ? 0.6f : 0;
+                p.champ.render(r, base, p.champ.anim, p.moving);
+            }
+            r.flash = 0;
+        }
 
         // dönen kılıçlar
-        int bl = lvl("blades");
-        if (bl > 0) {
+        for (Player p : players) {
+            int bl = p.lvl("blades");
+            if (bl <= 0 || p.downed) continue;
             int n = 1 + bl;
             float rad = 3.0f * p.area;
+            float baseAng = role == Role.CLIENT ? menuAnim * 3.2f : p.bladeAngle;
             for (int k = 0; k < n; k++) {
-                double a = bladeAngle + k * Math.PI * 2 / n;
+                double a = baseAng + k * Math.PI * 2 / n;
                 float bx = p.x + (float) Math.cos(a) * rad, bz = p.z + (float) Math.sin(a) * rad;
                 r.draw(r.cube, r.at(bx, 1.0f, bz).rotateY((float) -a).scale(0.12f, 0.08f, 1.1f), 0xd8e0ea, 0.5f);
                 r.draw(r.cube, r.at(bx, 1.0f, bz).rotateY((float) -a).translate(0, 0, -0.5f).scale(0.4f, 0.1f, 0.1f), 0xe0b23a);
@@ -1334,17 +1724,16 @@ public final class Game {
             }
         }
 
-        // kalkan balonu
-        if (p.shield > 0) {
-            glDepthMask(false);
+        // kalkan balonları
+        glDepthMask(false);
+        for (Player p : players) {
+            if (p.shield <= 0 || p.downed) continue;
             r.alpha = 0.22f + 0.05f * (float) Math.sin(menuAnim * 8);
-            r.draw(r.sphere, r.at(p.x, 1.1f, p.z).scale(2.5f), champ.shieldColor(), 1f);
-            r.alpha = 1;
-            glDepthMask(true);
+            r.draw(r.sphere, r.at(p.x, 1.1f, p.z).scale(2.5f), p.champ.shieldColor(), 1f);
         }
+        r.alpha = 1;
 
         // eklemeli (parlayan) efektler
-        glDepthMask(false);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
         for (Particle pt : particles) {
             if (!visible(pt.x, pt.z)) continue;
@@ -1355,12 +1744,12 @@ public final class Game {
         for (RingFx f : rings) {
             float k = 1 - f.life / f.max;
             float rad = f.r0 + (f.r1 - f.r0) * (1 - (1 - k) * (1 - k));
-            r.alpha = 1 - k;
+            r.alpha = Math.max(0, 1 - k);
             r.draw(r.ring, r.at(f.x, 0.1f, f.z).scale(rad * 2, 1, rad * 2), f.color, 1f);
         }
         for (Beam b : beams) {
             if (!b.fired) continue;
-            float k = b.life / b.max;
+            float k = Math.max(0, b.life / b.max);
             r.alpha = k;
             if (b.lightning) {
                 float mx = (b.x1 + b.x2) / 2 + (rng.nextFloat() - .5f) * 1.2f, mz = (b.z1 + b.z2) / 2 + (rng.nextFloat() - .5f) * 1.2f;
@@ -1402,21 +1791,21 @@ public final class Game {
         float s = p.scale;
         base.translation(p.x, 0, p.z).rotateY(p.rot).scale(s);
         switch (p.type) {
-            case 0 -> { // kaya
+            case 0 -> {
                 r.draw(r.sphere, r.m(base).translate(0, 0.3f, 0).scale(2.2f, 1.2f, 1.7f), 0x4b5563);
                 r.draw(r.sphere, r.m(base).translate(0.9f, 0.2f, 0.5f).scale(1.1f, 0.8f, 1f), 0x5a6474);
             }
-            case 1 -> { // kristal
+            case 1 -> {
                 r.draw(r.cone, r.m(base).translate(0, 1.0f, 0).scale(0.6f, 2.2f, 0.6f), 0x3fd4e8, 0.6f);
                 r.draw(r.cone, r.m(base).translate(0.5f, 0.6f, 0.2f).rotateZ(-0.4f).scale(0.4f, 1.4f, 0.4f), 0x7f6aff, 0.6f);
                 r.draw(r.cone, r.m(base).translate(-0.4f, 0.5f, -0.2f).rotateZ(0.5f).scale(0.35f, 1.1f, 0.35f), 0x3fd4e8, 0.6f);
             }
-            case 2 -> { // ağaç
+            case 2 -> {
                 r.draw(r.cyl, r.m(base).translate(0, 1f, 0).scale(0.4f, 2f, 0.4f), 0x5a3b26);
                 r.draw(r.cone, r.m(base).translate(0, 2.6f, 0).scale(2.4f, 2.2f, 2.4f), 0x2f6b3f);
                 r.draw(r.cone, r.m(base).translate(0, 3.6f, 0).scale(1.7f, 1.7f, 1.7f), 0x3a7f4a);
             }
-            default -> { // yıkık sütun
+            default -> {
                 r.draw(r.cyl, r.m(base).translate(0, 1.3f, 0).scale(1.0f, 2.6f, 1.0f), 0x6b6f80);
                 r.draw(r.cube, r.m(base).translate(0, 0.15f, 0).scale(1.5f, 0.3f, 1.5f), 0x5b5f70);
                 r.draw(r.cube, r.m(base).translate(0.9f, 0.25f, 0.4f).rotateY(0.7f).rotateZ(0.3f).scale(0.8f, 0.5f, 0.6f), 0x6b6f80);
@@ -1517,8 +1906,9 @@ public final class Game {
     private void renderMenu3D() {
         float aspect = fbW / (float) Math.max(1, fbH);
         proj.setPerspective((float) Math.toRadians(40), aspect, 0.3f, 200f);
-        camPos.set(-1.7f, 2.4f, 6.4f);
-        view.setLookAt(camPos.x, camPos.y, camPos.z, -1.7f, 1.0f, 0, 0, 1, 0);
+        float camOff = -1.7f;
+        camPos.set(camOff, 2.4f, 6.4f);
+        view.setLookAt(camPos.x, camPos.y, camPos.z, camOff, 1.0f, 0, 0, 1, 0);
         r.begin(proj, view, camPos, ARENA, FOG);
         r.mode = 1;
         r.draw(r.plane, r.at(0, 0, 0).scale(200, 1, 200), 0xffffff);
@@ -1530,10 +1920,8 @@ public final class Game {
         r.draw(r.ring, r.at(0, 0.22f, 0).rotateY(menuAnim).scale(3.3f, 1, 3.3f), c.color, 1f);
         r.alpha = 1;
         glDepthMask(true);
-        c.anim += 0.016f;
         base.translation(0, 0.2f, 0).rotateY(menuAnim * 0.7f);
         c.render(r, base, menuAnim, false);
-        // arka planda birkaç düşman
         for (int i = 0; i < 6; i++) {
             Enemy e = new Enemy();
             e.kind = i % 3 == 0 ? EnemyKind.BRUTE : EnemyKind.MINION;
@@ -1554,26 +1942,25 @@ public final class Game {
         Champion c = previews[menuSel];
         int cc = 0xff000000 | c.color;
         ui.textS("RİFT SÜRÜSÜ", 40, 30, 64, 0xffff4fa3);
-        ui.textS("League of Legends: Swarm parodisi — hayatta kal, güçlen, Void Titanı'nı yen", 44, 104, 18, 0xffc8d0e0);
+        ui.textS("League of Legends: Swarm parodisi — hayatta kal, güçlen, Void Titanı'nı yen (tek başına veya 4 kişiye kadar co-op)", 44, 104, 18, 0xffc8d0e0);
 
         float px = 40, py = 160, pw = Math.min(560, W * 0.42f);
-        ui.rect(px - 16, py - 16, pw + 32, H - py - 160, 0xb0101624);
-        ui.rect(px - 16, py - 16, 6, H - py - 160, cc);
+        ui.rect(px - 16, py - 16, pw + 32, H - py - 230, 0xb0101624);
+        ui.rect(px - 16, py - 16, 6, H - py - 230, cc);
         ui.textS(c.name, px, py, 46, cc);
         ui.textS(c.title, px, py + 54, 20, 0xffb8c2d8);
         float y = py + 92;
         for (String line : ui.wrap(c.desc, pw, 17)) { ui.textS(line, px, y, 17, 0xffe8ecf4); y += 24; }
-        y += 14;
-        String[] keys = {"Q", "E", "R", "F"};
+        y += 10;
         for (int i = 0; i < 4; i++) {
             ui.rect(px, y, 30, 30, cc);
-            ui.text(keys[i], px + 8, y + 2, 22, 0xff101624);
+            ui.text(KEYS[i], px + 8, y + 2, 22, 0xff101624);
             ui.textS(c.abil[i], px + 42, y + 3, 19, 0xffffffff);
             y += 32;
             for (String line : ui.wrap(c.abilDesc[i], pw - 42, 15)) { ui.text(line, px + 42, y, 15, 0xffaab4c8); y += 20; }
-            y += 8;
+            y += 6;
         }
-        ui.text(String.format("Can: %.0f   Hız: %.1f", c.baseHp, c.baseSpeed), px, y + 4, 16, 0xff8fa0bc);
+        ui.text(String.format("Can: %.0f   Hız: %.1f", c.baseHp, c.baseSpeed), px, y + 2, 16, 0xff8fa0bc);
 
         for (int i = 0; i < 3; i++) {
             float[] rc = tabRect(i);
@@ -1583,19 +1970,96 @@ public final class Game {
             ui.frame(rc[0], rc[1], rc[2], rc[3], sel ? 3 : 1, sel ? col : 0xff40485c);
             ui.textC((i + 1) + ". " + previews[i].name, rc[0] + rc[2] / 2, rc[1] + 14, 22, sel ? col : 0xffd0d6e0);
         }
-        float blink = 0.6f + 0.4f * (float) Math.sin(menuAnim * 4);
-        ui.textC("← →  /  A D ile seç   •   ENTER / SPACE ile başla", W / 2, H - 52, 20, ((int) (blink * 255) << 24) | 0xffffff);
+        String[] modes = {"ENTER  Tek oyuncu", "H  Oda kur (host)", "J  Odaya katıl"};
+        for (int i = 0; i < 3; i++) {
+            float[] rc = modeRect(i);
+            boolean hov = inside(rc);
+            ui.rect(rc[0], rc[1], rc[2], rc[3], hov ? 0xf0303a58 : 0xe0182034);
+            ui.frame(rc[0], rc[1], rc[2], rc[3], 2, i == 0 ? 0xffff4fa3 : 0xff7fe0ff);
+            ui.textC(modes[i], rc[0] + rc[2] / 2, rc[1] + 13, 20, 0xffffffff);
+        }
+        ui.textC("← → / A D: şampiyon seç", W / 2, H - 52, 16, 0x90ffffff);
+    }
+
+    private void renderLobbyUi() {
+        float W = winW, H = winH;
+        boolean host = role == Role.HOST;
+        float px = 40, pw = Math.min(W * 0.55f, 820);
+        ui.rect(px - 16, 24, pw + 32, H - 48, 0xd0101624);
+        ui.textS(host ? "ODA KUR (HOST)" : "ODAYA KATIL", px, 36, 44, host ? 0xffff4fa3 : 0xff7fe0ff);
+        ui.text("Şampiyonun: " + previews[menuSel].name, px, 90, 18, 0xff000000 | previews[menuSel].color);
+
+        String code = net != null ? net.myCode() : null;
+        float y = 140;
+        ui.text(host ? "1) Oda kodunu arkadaşına gönder:" : "1) Kendi kodunu host'a gönder:", px, y, 18, 0xffd0d6e0);
+        y += 32;
+        ui.rect(px, y, 440, 52, 0xff1a2236);
+        ui.frame(px, y, 440, 52, 2, 0xff3a4a6a);
+        ui.textS(code != null ? code : "...", px + 16, y + 6, 38, code != null ? 0xffffffff : 0xff808898);
+        float[] hit = copyRect();
+        ui.rect(hit[0], hit[1], hit[2], hit[3], inside(hit) ? 0xff3a5a8a : 0xff2a3a5a);
+        ui.textC("Kopyala", hit[0] + hit[2] / 2, hit[1] + 9, 18, 0xffffffff);
+        y += 60;
+        if (net != null) {
+            String st = net.net.stunStatus;
+            if (!"hazır".equals(st)) { ui.text(st, px, y, 15, 0xffffb347); y += 22; }
+            ui.text("Doğrudan adres: " + net.publicStr() + "     Yerel ağ: " + net.localStr(), px, y, 15, 0xff8fa0bc);
+            y += 22;
+            ui.text("(Kopyalama: Cmd/Ctrl + C)", px, y, 13, 0x90ffffff);
+            y += 34;
+        }
+
+        ui.text(host ? "2) Arkadaşının kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:" : "2) Host'un kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:", px, y, 18, 0xffd0d6e0);
+        y += 32;
+        ui.rect(px, y, pw, 48, 0xff0c111c);
+        ui.frame(px, y, pw, 48, 2, 0xff7fe0ff);
+        String t = in.typed.toString();
+        boolean caret = ((int) (menuAnim * 2)) % 2 == 0;
+        ui.text(t + (caret ? "|" : ""), px + 14, y + 10, 24, 0xffffffff);
+        y += 62;
+        if (net != null) {
+            for (String line : ui.wrap(net.status, pw, 17)) { ui.text(line, px, y, 17, 0xffffd84a); y += 24; }
+        }
+        y += 10;
+        ui.text("Oyuncular:", px, y, 20, 0xffffffff);
+        y += 30;
+        if (players.isEmpty()) { ui.text("(henüz bağlanılmadı)", px + 10, y, 17, 0xff808898); y += 26; }
+        for (Player p : players) {
+            int c = 0xff000000 | p.champ.color;
+            ui.rect(px + 10, y + 4, 12, 12, c);
+            String me = (host && p.local) || (!host && net != null && p.id == net.myId) ? "  (sen)" : "";
+            ui.text(p.displayName() + me, px + 30, y, 18, c);
+            y += 26;
+        }
+        y = Math.max(y + 10, H - 150);
+        String help = host
+                ? "3) Arkadaşın bağlanınca kutu BOŞKEN ENTER ile oyunu başlat.  ESC: geri"
+                : "3) Bağlanınca host'un başlatmasını bekle.  ESC: geri";
+        ui.text(help, px, y, 17, 0xffc8d0e0);
+        y += 26;
+        for (String line : ui.wrap("İpucu: İkiniz de birbirinizin kodunu girin (delik açma iki taraftan çalışır). Bağlanmazsa host, modeminde UDP "
+                + Net.DEFAULT_PORT + " portunu bilgisayarına yönlendirsin; o zaman sadece katılan kişinin host kodunu girmesi yeter.", pw, 14)) {
+            ui.text(line, px, y, 14, 0xff8fa0bc);
+            y += 19;
+        }
+    }
+
+    private void renderNotice() {
+        if (noticeT > 0 && notice != null) {
+            int a = (int) (Math.min(1, noticeT) * 255);
+            float w = ui.width(notice, 18) + 40;
+            ui.rect(winW / 2f - w / 2, winH - 44, w, 32, (a * 3 / 4) << 24);
+            ui.textC(notice, winW / 2f, winH - 40, 18, (a << 24) | 0xffd84a);
+        }
     }
 
     private void renderWorldUi() {
-        // hasar sayıları
         for (DmgText t : texts) {
             float[] s = project(t.x, t.y, t.z);
             if (s == null) continue;
-            int a = (int) (Math.min(1, t.life / 0.4f) * 255);
+            int a = (int) (Math.max(0, Math.min(1, t.life / 0.4f)) * 255);
             ui.textC(t.s, s[0], s[1], t.size, (a << 24) | (t.color & 0xffffff));
         }
-        // can barları (hasar almış iri düşmanlar)
         for (Enemy e : enemies) {
             if (e.dead || e.kind == EnemyKind.BOSS || e.hp >= e.maxHp) continue;
             if (!e.elite && e.kind != EnemyKind.BRUTE && e.kind != EnemyKind.SPITTER) continue;
@@ -1605,12 +2069,18 @@ public final class Game {
             ui.rect(s[0] - w / 2, s[1], w, 6, 0xc0000000);
             ui.rect(s[0] - w / 2, s[1], w * Math.max(0, e.hp / e.maxHp), 6, e.elite ? 0xffffd84a : 0xffff5a5a);
         }
-        // oyuncu üstü mini can barı
-        float[] s = project(player.x, 2.6f, player.z);
-        if (s != null) {
+        boolean mp = players.size() > 1;
+        for (Player p : players) {
+            float[] s = project(p.x, p.downed ? 1.4f : 2.6f, p.z);
+            if (s == null) continue;
+            if (mp) ui.textC(p.label + " " + p.champ.name, s[0], s[1] - 22, 14, p.local ? 0xffffffff : (0xff000000 | p.champ.color));
+            if (p.downed) {
+                ui.textC("KALDIR!", s[0], s[1] + 10, 16, 0xffff4a5a);
+                continue;
+            }
             ui.rect(s[0] - 36, s[1], 72, 7, 0xc0000000);
-            ui.rect(s[0] - 36, s[1], 72 * player.hp / player.maxHp, 7, 0xff5ad17a);
-            if (player.shield > 0) ui.rect(s[0] - 36, s[1] - 4, Math.min(72, 72 * player.shield / player.maxHp), 3, 0xffffffff);
+            ui.rect(s[0] - 36, s[1], 72 * Math.max(0, p.hp / p.maxHp), 7, p.local ? 0xff5ad17a : 0xff7fb0ff);
+            if (p.shield > 0) ui.rect(s[0] - 36, s[1] - 4, Math.min(72, 72 * p.shield / p.maxHp), 3, 0xffffffff);
         }
     }
 
@@ -1620,87 +2090,112 @@ public final class Game {
         return new float[]{(v4.x / v4.w * 0.5f + 0.5f) * winW, (1 - (v4.y / v4.w * 0.5f + 0.5f)) * winH};
     }
 
+    private boolean bossAlive() { return role == Role.CLIENT ? bossAliveNet : boss != null && !boss.dead; }
+
+    private float bossFrac() { return role == Role.CLIENT ? bossFracNet : (boss != null ? boss.hp / boss.maxHp : 0); }
+
     private void renderHud() {
         float W = winW, H = winH;
         Player p = player;
-        // XP
+        Champion ch = p.champ;
         ui.rect(0, 0, W, 12, 0xd00b0f1a);
-        ui.rect(0, 0, W * Math.min(1, p.xp / p.xpNext), 12, 0xff3fa9ff);
-        ui.textS("Sv " + p.level, 14, 18, 26, 0xffffffff);
-        // süre
+        ui.rect(0, 0, W * Math.min(1, teamXp / Math.max(1, xpNext)), 12, 0xff3fa9ff);
+        ui.textS("Sv " + teamLevel, 14, 18, 26, 0xffffffff);
         ui.textC(String.format("%02d:%02d", (int) time / 60, (int) time % 60), W / 2, 18, 38, 0xffffffff);
         ui.textC("Öldürme: " + kills, W / 2, 62, 18, 0xffd0d6e0);
         if (!bossSpawned) {
-            float left = BOSS_TIME - time;
+            float left = Math.max(0, BOSS_TIME - time);
             ui.textS(String.format("Boss: %d:%02d", (int) left / 60, (int) left % 60), W - 150, 18, 18, 0xffb07aff);
         }
-        // boss barı
-        if (boss != null && !boss.dead) {
+        if (role != Role.SOLO) {
+            float ty = 48;
+            for (Player q : players) {
+                if (q == p) continue;
+                int c = 0xff000000 | q.champ.color;
+                ui.textS(q.displayName(), W - 220, ty, 15, c);
+                ui.rect(W - 220, ty + 20, 200, 8, 0xc0000000);
+                if (q.downed) ui.text("DÜŞTÜ", W - 214, ty + 16, 13, 0xffff4a5a);
+                else ui.rect(W - 220, ty + 20, 200 * Math.max(0, q.hp / q.maxHp), 8, 0xff7fb0ff);
+                ty += 40;
+            }
+        }
+        if (bossAlive()) {
             float bw = W * 0.5f, x = (W - bw) / 2, y = 96;
             ui.textC("VOID TİTANI", W / 2, y - 4, 20, 0xffff4fa3);
             ui.rect(x, y + 22, bw, 16, 0xd0000000);
-            ui.rect(x, y + 22, bw * boss.hp / boss.maxHp, 16, 0xffc83a8a);
+            ui.rect(x, y + 22, bw * bossFrac(), 16, 0xffc83a8a);
             ui.frame(x, y + 22, bw, 16, 2, 0xffff4fa3);
         }
-        // banner
         if (bannerT > 0 && banner != null) {
             int a = (int) (Math.min(1, bannerT / 0.5f) * 255);
             ui.textC(banner, W / 2, H * 0.22f, 40, (a << 24) | (bannerColor & 0xffffff));
         }
 
-        // yetenekler
         float size = 64, gap = 12, total = 4 * size + 3 * gap, x0 = (W - total) / 2, y0 = H - size - 34;
-        int cc = 0xff000000 | champ.color;
-        String[] keys = {"Q", "E", "R", "F"};
+        int cc = 0xff000000 | ch.color;
         for (int i = 0; i < 4; i++) {
             float x = x0 + i * (size + gap);
-            boolean ready = champ.cd[i] <= 0;
+            boolean ready = ch.cd[i] <= 0 && !p.downed;
             ui.rect(x, y0, size, size, 0xe0151b2a);
-            ui.rect(x + 4, y0 + 4, size - 8, size - 8, ready ? (0x60000000 | (champ.color & 0xffffff)) : 0x40303848);
-            ui.textC(keys[i], x + size / 2, y0 + 12, 32, ready ? 0xffffffff : 0xff8090a0);
-            if (!ready) {
-                float max = champ.cdMax[i] * (i == 0 && champ.cdMax[0] < 1.5f ? 1 : p.cdMult);
-                float frac = Math.min(1, champ.cd[i] / Math.max(0.01f, max));
+            ui.rect(x + 4, y0 + 4, size - 8, size - 8, ready ? (0x60000000 | (ch.color & 0xffffff)) : 0x40303848);
+            ui.textC(KEYS[i], x + size / 2, y0 + 12, 32, ready ? 0xffffffff : 0xff8090a0);
+            if (ch.cd[i] > 0) {
+                float frac = Math.min(1, ch.cd[i] / Math.max(0.01f, ch.effCd(i)));
                 ui.rect(x, y0, size, size * frac, 0xa0000000);
-                ui.textC(String.format("%.0f", Math.ceil(champ.cd[i])), x + size / 2, y0 + size - 26, 18, 0xffffd84a);
+                ui.textC(String.format("%.0f", Math.ceil(ch.cd[i])), x + size / 2, y0 + size - 26, 18, 0xffffd84a);
             }
             ui.frame(x, y0, size, size, 2, ready ? cc : 0xff3a4252);
-            String n = champ.abil[i];
+            String n = ch.abil[i];
             float fs = 12;
             while (ui.width(n, fs) > size + gap - 2 && fs > 8) fs -= 0.5f;
             ui.textC(n, x + size / 2, y0 + size + 6, fs, 0xffc0c8d8);
         }
-        // can barı
         float hbY = y0 - 30;
         ui.rect(x0, hbY, total, 20, 0xd0000000);
         float hpF = Math.max(0, p.hp / p.maxHp);
         ui.rect(x0, hbY, total * hpF, 20, hpF > 0.35f ? 0xff3fbf6a : 0xffe0503a);
         if (p.shield > 0) ui.rect(x0, hbY, Math.min(total, total * p.shield / p.maxHp), 6, 0xe0ffffff);
         ui.frame(x0, hbY, total, 20, 2, 0xff3a4252);
-        ui.textC(Math.round(p.hp) + " / " + Math.round(p.maxHp), W / 2, hbY + 1, 16, 0xffffffff);
-        String st = champ.status();
-        if (st != null) ui.textC(st, W / 2, hbY - 30, 20, cc);
-        ui.textS(champ.name, x0 - ui.width(champ.name, 22) - 20, y0 + 18, 22, cc);
+        ui.textC(Math.round(Math.max(0, p.hp)) + " / " + Math.round(p.maxHp), W / 2, hbY + 1, 16, 0xffffffff);
+        String st = ch.status();
+        if (st != null && !p.downed) ui.textC(st, W / 2, hbY - 30, 20, cc);
+        ui.textS(ch.name, x0 - ui.width(ch.name, 22) - 20, y0 + 18, 22, cc);
 
-        // yükseltmeler
         float y = 56;
-        for (Map.Entry<String, Integer> en : upLevels.entrySet()) {
-            Upgrade u = upgradeIndex.get(en.getKey());
+        for (Map.Entry<String, Integer> en : p.ups.entrySet()) {
+            Upgrade u = p.upIndex.get(en.getKey());
             if (u == null) continue;
             ui.rect(14, y + 3, 10, 10, u.color);
             ui.textS(u.name + "  " + en.getValue(), 30, y, 15, 0xffd8dee8);
             y += 21;
         }
-        ui.text("WASD hareket  •  sol tık basılı: fareye nişan  •  Q E R F yetenek  •  ESC duraklat", 14, H - 24, 13, 0x90ffffff);
+        if (p.downed && state == State.PLAY) {
+            ui.textC("DÜŞTÜN!", W / 2, H * 0.4f, 56, 0xffff4a5a);
+            ui.textC("Bir takım arkadaşın yanına gelip " + (int) REVIVE_TIME + " sn durursa ayağa kalkarsın", W / 2, H * 0.4f + 70, 20, 0xffffffff);
+            float k = p.reviveT / REVIVE_TIME;
+            ui.rect(W / 2 - 150, H * 0.4f + 104, 300, 12, 0xc0000000);
+            ui.rect(W / 2 - 150, H * 0.4f + 104, 300 * k, 12, 0xff5ad17a);
+        }
+        ui.text("WASD hareket  •  sol tık basılı: fareye nişan  •  Q E R F yetenek  •  ESC " + (role == Role.SOLO ? "duraklat" : "menü"), 14, H - 24, 13, 0x90ffffff);
     }
 
     private void renderLevelUp() {
         float W = winW, H = winH;
         ui.rect(0, 0, W, H, 0xb005070d);
-        ui.textC("SEVİYE ATLADIN!", W / 2, H * 0.17f, 52, 0xffffd84a);
+        ui.textC("SEVİYE ATLADINIZ!", W / 2, H * 0.17f, 52, 0xffffd84a);
+        Player p = player;
+        if (p.picked) {
+            ui.textC("Seçimin alındı. Diğer oyuncular seçiyor...", W / 2, H * 0.17f + 66, 22, 0xffd0d6e0);
+            float y = H * 0.36f;
+            for (Player q : players) {
+                ui.textC(q.displayName() + (q.picked || q.local ? "  • hazır" : "  • seçiyor..."), W / 2, y, 20, q.picked || q.local ? 0xff5ad17a : 0xffffb347);
+                y += 30;
+            }
+            return;
+        }
         ui.textC("Bir güçlendirme seç  (1 / 2 / 3 veya tıkla)", W / 2, H * 0.17f + 66, 20, 0xffd0d6e0);
-        for (int i = 0; i < choices.size(); i++) {
-            Upgrade u = choices.get(i);
+        for (int i = 0; i < p.choices.size(); i++) {
+            Upgrade u = p.choices.get(i);
             float[] rc = cardRect(i);
             boolean hov = inside(rc);
             ui.rect(rc[0], rc[1], rc[2], rc[3], hov ? 0xf62a3350 : 0xf01a2030);
@@ -1708,7 +2203,7 @@ public final class Game {
             ui.frame(rc[0], rc[1], rc[2], rc[3], hov ? 3 : 1, hov ? u.color : 0xff40485c);
             ui.textS((i + 1) + "", rc[0] + 14, rc[1] + 18, 30, 0x90ffffff);
             ui.textS(u.name, rc[0] + 48, rc[1] + 22, 26, u.color);
-            int cur = lvl(u.id);
+            int cur = p.lvl(u.id);
             String lv = u.max > 999 ? "" : (cur == 0 ? "YENİ!" : "Seviye " + cur + " → " + (cur + 1));
             ui.text(lv, rc[0] + 48, rc[1] + 56, 16, cur == 0 ? 0xff7fe0ff : 0xffa0a8b8);
             float y = rc[1] + 92;

@@ -1,20 +1,55 @@
-# Rift Sürüsü — LoL Swarm parodisi (Java + OpenGL)
+# Rift Sürüsü — LoL Swarm parodisi (Java + OpenGL, co-op)
 
-League of Legends'ın **Swarm** modu ve Vampire Survivors tarzında bir 3D hayatta kalma oyunu.
-Java 17+, LWJGL 3 (OpenGL 3.3 core + GLFW) ve JOML kullanır. Tüm modeller kodla, ilkel
-şekillerden (küp, küre, silindir, koni) üretilir; harici asset yok.
+League of Legends'ın **Swarm** modu ve Vampire Survivors tarzında, **1–4 kişilik co-op** oynanabilen
+3D bir hayatta kalma oyunu. Java 17+, LWJGL 3 (OpenGL 3.3 + GLFW) ve JOML kullanır. Tüm modeller
+kodla üretilir; harici asset yok. **Mac (Apple Silicon/Intel), Windows (x64/ARM) ve Linux'ta çalışır.**
 
-## Çalıştırma (IntelliJ IDEA)
+## Geliştirirken çalıştırma (IntelliJ)
 
-1. Projeyi IntelliJ'de aç. Sağ altta **"Maven build script found → Load"** çıkarsa tıkla.
-   Çıkmazsa `pom.xml` dosyasına sağ tıkla → **Add as Maven Project**.
-2. Maven bağımlılıkları indirdikten sonra `src/main/java/swarm/Main.java` dosyasını aç ve ▶ **Run**.
+1. Projeyi aç → sağ altta **"Maven build script found → Load"** (yoksa `pom.xml` → sağ tık → *Add as Maven Project*).
+2. `src/main/java/swarm/Main.java` → ▶ **Run**.
 
-macOS'ta GLFW için gereken `-XstartOnFirstThread` bayrağını `Main` kendisi ekleyip oyunu yeniden
-başlatır, ekstra ayar gerekmez. (Debugger ile çalıştırmak istersen Run Configuration → VM options:
-`-XstartOnFirstThread --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow`)
+macOS için gereken `-XstartOnFirstThread` bayrağını `Main` kendisi ekleyip oyunu yeniden başlatır.
 
-Terminalden: `mvn compile exec:exec`
+## Arkadaşına göndermek için tek dosya (Mac + Windows)
+
+```
+mvn package
+```
+(IntelliJ'de: sağdaki **Maven** paneli → *Lifecycle* → **package**.)
+
+Çıktı: `target/rift-surusu.jar`. İçinde tüm platformların kütüphaneleri var, aynı dosya her yerde çalışır.
+
+- Arkadaşının bilgisayarında **Java 17 veya üstü** olmalı (ücretsiz: <https://adoptium.net> → Temurin).
+- Çalıştırma: `java -jar rift-surusu.jar` ya da jar'ın yanına `dagitim/` klasöründeki başlatıcıyı koyup çift tıkla:
+  - Windows: `RiftSurusu.bat`
+  - Mac: `RiftSurusu.command`
+
+## Co-op nasıl oynanır (internet üzerinden, Hamachi yok)
+
+Oyun doğrudan **UDP** ile bağlanır. Kendi sunucu gerekmez: her oyun, herkese açık bir STUN sunucusuna
+sorup kendi internet adresini öğrenir ve bunu bir **oda kodu** olarak gösterir (ör. `7KQ2-M9XA-4T`).
+
+1. Herkes ana menüde şampiyonunu seçer.
+2. Bir kişi **H — Oda kur** der. Diğerleri **J — Odaya katıl** der.
+3. **Kodları birbirinize gönderin** (WhatsApp, Discord...). Ekrandaki kodu *Kopyala* butonu veya Cmd/Ctrl+C ile kopyalayabilirsin.
+4. Katılan kişi host'un kodunu yapıştırır (Cmd/Ctrl+V) → ENTER.
+   Host da katılanın kodunu yapıştırır → ENTER. *(İki taraf da birbirine paket atınca modemler bağlantıya izin verir: "UDP hole punching".)*
+5. Lobide herkes görününce host, kutu boşken **ENTER**'a basar ve oyun başlar.
+
+**Bağlanmazsa:** Bazı modem/operatörlerde (özellikle CGNAT veya "simetrik NAT" kullananlar, bazı mobil hatlar)
+delik açma çalışmaz. O zaman host, modeminde **UDP 27015** portunu kendi bilgisayarına yönlendirsin
+(port forwarding). Bunu yaptıktan sonra yalnızca katılan kişinin host kodunu girmesi yeter.
+Aynı evdeyseniz lobide yazan "Yerel ağ" adresini de girebilirsiniz.
+
+İlk açılışta **Windows Güvenlik Duvarı / macOS** "Java gelen bağlantıları kabul etsin mi?" diye sorarsa **İzin ver** de.
+
+### Co-op kuralları
+- Tecrübe ve seviye takımca paylaşılır; seviye atlayınca **herkes kendi kartını seçer**, herkes seçene kadar oyun durur.
+- Canı biten oyuncu **düşer**; bir takım arkadaşı yanında 3 sn durursa %40 canla kalkar. Herkes düşerse oyun biter.
+- Oyuncu sayısı arttıkça düşmanlar daha sık gelir ve daha dayanıklı olur.
+- Oyunu host hesaplar. Diğer oyuncular kendi hareketlerini anında görür (tahmin), kalan her şey host'tan gelir.
+  Saniyede ~20 güncelleme, oyuncu başına kabaca 20–40 KB/sn.
 
 ## Kontroller
 
@@ -23,9 +58,9 @@ Terminalden: `mvn compile exec:exec`
 | W A S D / ok tuşları | Hareket |
 | Temel saldırı | Otomatik (en yakın düşmana) |
 | Sol tık basılı | Temel saldırıyı fareye doğrult |
-| Q E R F | Yetenekler (fare yönüne/noktasına) — W hareket olduğu için 2. yetenek E'de, ultiler F'de |
+| Q E R F | Yetenekler (fare yönüne/noktasına) |
 | 1 / 2 / 3 veya tık | Seviye atlayınca güçlendirme seç |
-| ESC / P | Duraklat |
+| ESC | Tek oyuncuda duraklat, co-op'ta menü (oyun arkada devam eder) |
 
 ## Şampiyonlar
 
@@ -43,26 +78,22 @@ Terminalden: `mvn compile exec:exec`
 ## Oyun akışı
 
 - Düşmanlar zamanla çoğalır ve güçlenir: minyon, koşucu, iri dev, tükürücü.
-- Her dakika **elit** düşman (taçlı, sarı) gelir; öldürünce tecrübe yağmuru, can ve mıknatıs düşürür.
-- Belli aralıklarla etrafını saran **sürü dalgaları**.
-- **8:00**'de **Void Titanı** uyanır: yere çarpma, minyon çağırma + mermi halkası, hücum. Onu yen → zafer.
-- Seviye atladıkça 3 güçlendirmeden birini seçersin: genel istatistikler, ortak silahlar
-  (Dönen Kılıçlar, Şimşek Zinciri, Buz Halkası) ve şampiyona özel geliştirmeler.
+- Her dakika **elit** düşman (taçlı, sarı) gelir; tecrübe yağmuru, can ve mıknatıs düşürür.
+- Belli aralıklarla etrafınızı saran **sürü dalgaları**.
+- **8:00**'de **Void Titanı** uyanır: her oyuncuya yere çarpma, minyon çağırma + mermi halkası, hücum. Onu yenin → zafer.
 
 ## Kod yapısı
 
 | Dosya | İçerik |
 |---|---|
-| `Main` | Giriş noktası, macOS için JVM'i doğru bayraklarla yeniden başlatma |
-| `Game` | Oyun döngüsü, durumlar, spawn, çarpışma (uzaysal ızgara), efektler, çizim, HUD |
-| `Champion` + `Kivilcim`, `DemirMuhafiz`, `Lumina` | Şampiyon kitleri ve 3D modelleri |
+| `Main` | Giriş noktası; macOS/Windows için JVM'i doğru bayraklarla yeniden başlatma |
+| `Game` | Oyun döngüsü, durumlar, oyuncular, spawn, çarpışma, efektler, çizim, HUD, lobi |
+| `Net` | UDP soket, STUN (genel adres keşfi), oda kodu |
+| `NetSession` | Co-op protokolü: lobi, girdi, dünya durumu, efekt olayları, istemci tahmini |
+| `Champion` + `Kivilcim`, `DemirMuhafiz`, `Lumina` | Şampiyon kitleri, 3D modeller, ağ görsel durumu |
+| `Player` | Oyuncu istatistikleri, girdi, yükseltmeler |
 | `Renderer`, `Shader`, `Mesh`, `MeshFactory` | Işıklandırmalı 3D çizim, prosedürel meshler |
-| `UI`, `Font` | 2D arayüz, AWT ile üretilen Türkçe destekli font atlası |
-| `Upgrade` | Güçlendirme havuzu |
-| `Enemy`, `Projectile`, `Orb`, … | Basit veri sınıfları |
-
-Yeni şampiyon eklemek için `Champion`'dan türet, `Game.create()` içine ekle ve menüdeki
-`previews` dizisini büyüt.
+| `UI`, `Font` | 2D arayüz, Türkçe destekli font atlası |
 
 > Riot Games ile ilgisi olmayan, eğitim amaçlı bir hayran parodisidir; karakterler orijinal
 > isimlere ve modellere sahiptir, sadece yetenek fikirleri LoL'den esinlenmiştir.

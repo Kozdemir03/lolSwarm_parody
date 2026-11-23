@@ -2,6 +2,8 @@ package swarm;
 
 import org.joml.Matrix4f;
 
+import java.nio.ByteBuffer;
+
 import java.util.List;
 
 /**
@@ -38,7 +40,7 @@ final class Kivilcim extends Champion {
 
     @Override
     void tick(Game g, float dt) {
-        Player p = g.player;
+        Player p = me;
         lastShot += dt;
         if (lastShot > 2f) { stacks = 0; shotCount = 0; }
         if (swapAnim > 0) swapAnim -= dt;
@@ -61,7 +63,7 @@ final class Kivilcim extends Champion {
         atkTimer -= dt * as;
         if (atkTimer <= 0) {
             float range = rocketMode ? 17 : 13;
-            if (g.aim(range)) {
+            if (g.aim(me, range)) {
                 fire(g);
                 atkTimer = rocketMode ? 1f / 0.95f : 1f / 2.6f;
             } else atkTimer = 0;
@@ -69,18 +71,18 @@ final class Kivilcim extends Champion {
     }
 
     private void fire(Game g) {
-        Player p = g.player;
-        float dx = g.aimX - p.x, dz = g.aimZ - p.z;
+        Player p = me;
+        float dx = p.aimX - p.x, dz = p.aimZ - p.z;
         int n = 1 + p.projBonus;
         lastShot = 0;
         for (int i = 0; i < n; i++) {
             float[] d = dir(dx, dz, spreadOffset(i, 0.14f));
             if (rocketMode) {
-                Projectile pr = g.shoot(ProjKind.ROCKET, p.x, p.z, d[0], d[1], 21, rocketDmg, 18, 0.35f, TEAL);
+                Projectile pr = g.shoot(me, ProjKind.ROCKET, p.x, p.z, d[0], d[1], 21, rocketDmg, 18, 0.35f, TEAL);
                 pr.splash = rocketSplash * p.area;
                 pr.y = 1.4f;
             } else {
-                Projectile pr = g.shoot(ProjKind.BULLET, p.x, p.z, d[0], d[1], 30, minigunDmg, 14, 0.25f, PINK);
+                Projectile pr = g.shoot(me, ProjKind.BULLET, p.x, p.z, d[0], d[1], 30, minigunDmg, 14, 0.25f, PINK);
                 pr.knock = 1.5f;
             }
         }
@@ -92,7 +94,7 @@ final class Kivilcim extends Champion {
 
     @Override
     boolean cast(Game g, int slot) {
-        Player p = g.player;
+        Player p = me;
         switch (slot) {
             case 0 -> {
                 rocketMode = !rocketMode;
@@ -102,7 +104,7 @@ final class Kivilcim extends Champion {
                 return true;
             }
             case 1 -> {
-                float dx = g.mouseX - p.x, dz = g.mouseZ - p.z;
+                float dx = p.mouseX - p.x, dz = p.mouseZ - p.z;
                 p.face = (float) Math.atan2(dx, dz);
                 p.faceLock = 0.6f;
                 for (int i = 0; i < 12; i++) g.spark(p.x + (g.rng.nextFloat() - .5f) * 1.2f, 1.2f, p.z + (g.rng.nextFloat() - .5f) * 1.2f, 0x7ff9ff);
@@ -110,7 +112,7 @@ final class Kivilcim extends Champion {
                     int n = 1 + zapExtra * 2;
                     for (int i = 0; i < n; i++) {
                         float[] d = dir(dx, dz, spreadOffset(i, 0.18f));
-                        Projectile pr = g.shoot(ProjKind.ZAP, g.player.x, g.player.z, d[0], d[1], 55, zapDmg, 34, 0.7f, 0x7ff9ff);
+                        Projectile pr = g.shoot(me, ProjKind.ZAP, me.x, me.z, d[0], d[1], 55, zapDmg, 34, 0.7f, 0x7ff9ff);
                         pr.pierce = 999;
                         pr.slow = 0.6f;
                         pr.slowT = 2f;
@@ -122,15 +124,16 @@ final class Kivilcim extends Champion {
                 return true;
             }
             case 2 -> {
-                g.target(12);
-                float dx = g.tx - p.x, dz = g.tz - p.z;
+                g.target(me, 12);
+                float dx = p.tx - p.x, dz = p.tz - p.z;
                 float len = (float) Math.max(0.01, Math.hypot(dx, dz));
                 float px = -dz / len, pz = dx / len; // dik yön
                 for (int i = 0; i < chompers; i++) {
                     float off = (i - (chompers - 1) / 2f) * 1.9f;
                     Trap t = new Trap();
-                    t.x = g.clampA(g.tx + px * off);
-                    t.z = g.clampA(g.tz + pz * off);
+                    t.x = Game.clampA(p.tx + px * off);
+                    t.z = Game.clampA(p.tz + pz * off);
+                    t.owner = me;
                     t.arm = 0.6f;
                     t.life = 7f;
                     t.dmg = 50;
@@ -142,10 +145,10 @@ final class Kivilcim extends Champion {
                 return true;
             }
             case 3 -> {
-                float dx = g.mouseX - p.x, dz = g.mouseZ - p.z;
+                float dx = p.mouseX - p.x, dz = p.mouseZ - p.z;
                 p.face = (float) Math.atan2(dx, dz);
                 p.faceLock = 0.5f;
-                Projectile pr = g.shoot(ProjKind.MEGA, p.x, p.z, dx, dz, 20, megaDmg, 400, 1.1f, 0xd8344a);
+                Projectile pr = g.shoot(me, ProjKind.MEGA, p.x, p.z, dx, dz, 20, megaDmg, 400, 1.1f, 0xd8344a);
                 pr.splash = 6.5f * p.area;
                 pr.y = 1.6f;
                 g.shake(0.35f);
@@ -163,7 +166,7 @@ final class Kivilcim extends Champion {
             killCounter = 0;
             boolean was = excitedT > 0;
             excitedT = exciteDur;
-            if (!was) g.popText(g.player.x, 2.6f, g.player.z, "COŞKU!", 0xffff4fa3, 30);
+            if (!was) g.popText(me.x, 2.6f, me.z, "COŞKU!", 0xffff4fa3, 30);
         }
     }
 
@@ -176,6 +179,34 @@ final class Kivilcim extends Champion {
 
     @Override
     int shieldColor() { return 0xff9fd0; }
+
+    @Override
+    void visualTick(float dt) {
+        super.visualTick(dt);
+        lastShot += dt;
+        if (swapAnim > 0) swapAnim -= dt;
+        if (!rocketMode && lastShot < 0.35f) spin += dt * (14 + stacks * 8);
+    }
+
+    @Override
+    void writeVis(ByteBuffer b) {
+        b.put((byte) (rocketMode ? 1 : 0));
+        b.put((byte) stacks);
+        b.put((byte) maxStacks);
+        b.put((byte) (excitedT > 0 ? 1 : 0));
+        b.put(q(lastShot, 100));
+        b.put(q(swapAnim, 100));
+    }
+
+    @Override
+    void readVis(ByteBuffer b) {
+        rocketMode = b.get() != 0;
+        stacks = u8(b);
+        maxStacks = u8(b);
+        excitedT = b.get() != 0 ? exciteDur : 0;
+        lastShot = u8(b) / 100f;
+        swapAnim = u8(b) / 100f;
+    }
 
     @Override
     List<Upgrade> special() {

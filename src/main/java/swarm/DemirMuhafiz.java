@@ -2,6 +2,8 @@ package swarm;
 
 import org.joml.Matrix4f;
 
+import java.nio.ByteBuffer;
+
 import java.util.List;
 
 /** Garen benzeri: yakın dövüş kılıç, güçlendirilmiş darbe, kalkan, dönen yargı ve gökten düşen dev kılıç. */
@@ -32,7 +34,7 @@ final class DemirMuhafiz extends Champion {
 
     @Override
     void tick(Game g, float dt) {
-        Player p = g.player;
+        Player p = me;
         // Pasif: Kararlılık — 4 sn hasar almazsan hızlı can yenilenmesi
         if (g.time - p.lastHit > 4f) p.heal(p.maxHp * 0.02f * regenMult * dt);
 
@@ -48,7 +50,7 @@ final class DemirMuhafiz extends Champion {
             if (spinTick <= 0) {
                 spinTick = 0.22f;
                 float rad = spinRadius * p.area;
-                g.aoe(p.x, p.z, rad, spinDmg, e -> g.knock(e, p.x, p.z, 3));
+                g.aoe(me, p.x, p.z, rad, spinDmg, e -> g.knock(e, p.x, p.z, 3));
                 for (int i = 0; i < 6; i++) {
                     double a = g.rng.nextDouble() * Math.PI * 2;
                     g.spark(p.x + (float) Math.cos(a) * rad * 0.8f, 1.0f, p.z + (float) Math.sin(a) * rad * 0.8f, i % 2 == 0 ? STEEL : GOLD);
@@ -60,7 +62,7 @@ final class DemirMuhafiz extends Champion {
 
         atkTimer -= dt * p.asMult;
         if (atkTimer <= 0) {
-            if (g.aim(atkRange * p.area + 0.6f)) {
+            if (g.aim(me, atkRange * p.area + 0.6f)) {
                 swing(g);
                 atkTimer = 1f / 1.2f;
             } else atkTimer = 0;
@@ -68,8 +70,8 @@ final class DemirMuhafiz extends Champion {
     }
 
     private void swing(Game g) {
-        Player p = g.player;
-        float ang = (float) Math.atan2(g.aimX - p.x, g.aimZ - p.z);
+        Player p = me;
+        float ang = (float) Math.atan2(p.aimX - p.x, p.aimZ - p.z);
         float range = atkRange * p.area;
         float dmg = atkDmg * (empowered ? 2.5f : 1f);
         boolean emp = empowered;
@@ -85,7 +87,7 @@ final class DemirMuhafiz extends Champion {
             while (a > Math.PI) a -= (float) (2 * Math.PI);
             while (a < -Math.PI) a += (float) (2 * Math.PI);
             if (Math.abs(a) > halfArc && d > e.radius + 0.6f) continue;
-            g.damage(e, dmg, true);
+            g.damage(me, e, dmg, true);
             g.knock(e, p.x, p.z, emp ? 9 : 4);
             if (emp) e.rootT = Math.max(e.rootT, 1.2f);
         }
@@ -105,7 +107,7 @@ final class DemirMuhafiz extends Champion {
 
     @Override
     boolean cast(Game g, int slot) {
-        Player p = g.player;
+        Player p = me;
         switch (slot) {
             case 0 -> {
                 empowered = true;
@@ -129,8 +131,8 @@ final class DemirMuhafiz extends Champion {
                 return true;
             }
             case 3 -> {
-                g.target(14);
-                final float x = g.tx, z = g.tz;
+                g.target(me, 14);
+                final float x = p.tx, z = p.tz;
                 FallingSword s = new FallingSword();
                 s.x = x;
                 s.z = z;
@@ -138,9 +140,9 @@ final class DemirMuhafiz extends Champion {
                 s.stuck = 1.0f;
                 g.swords.add(s);
                 g.telegraph(x, z, 4.5f * p.area, 0.45f, 0xe0b23a, () -> {
-                    float rad = 4.5f * g.player.area;
-                    g.aoe(x, z, rad, 220, e -> {
-                        if (!e.dead && e.kind != EnemyKind.BOSS && e.hp < e.maxHp * execPct) g.execute(e);
+                    float rad = 4.5f * me.area;
+                    g.aoe(me, x, z, rad, 220, e -> {
+                        if (!e.dead && e.kind != EnemyKind.BOSS && e.hp < e.maxHp * execPct) g.execute(me, e);
                         else g.knock(e, x, z, 10);
                     });
                     g.explosion(x, z, rad, GOLD);
@@ -161,6 +163,27 @@ final class DemirMuhafiz extends Champion {
 
     @Override
     int shieldColor() { return 0xffd86a; }
+
+    @Override
+    void visualTick(float dt) {
+        super.visualTick(dt);
+        if (spinT > 0) { spinT -= dt; spinAngle += dt * 20; } else spinAngle = 0;
+        if (swingAnim > 0) swingAnim -= dt;
+    }
+
+    @Override
+    void writeVis(ByteBuffer b) {
+        b.put(q(spinT, 20));
+        b.put(q(swingAnim, 400));
+        b.put((byte) (empowered ? 1 : 0));
+    }
+
+    @Override
+    void readVis(ByteBuffer b) {
+        spinT = u8(b) / 20f;
+        swingAnim = u8(b) / 400f;
+        empowered = b.get() != 0;
+    }
 
     @Override
     List<Upgrade> special() {

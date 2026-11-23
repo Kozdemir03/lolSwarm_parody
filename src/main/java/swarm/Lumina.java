@@ -2,6 +2,8 @@ package swarm;
 
 import org.joml.Matrix4f;
 
+import java.nio.ByteBuffer;
+
 import java.util.List;
 
 /** Lux benzeri: ışık küresi, bağlayıcı ışık, parlak alan ve devasa son ışın. Yetenekler düşmanı işaretler. */
@@ -30,15 +32,15 @@ final class Lumina extends Champion {
 
     @Override
     void tick(Game g, float dt) {
-        Player p = g.player;
+        Player p = me;
         if (castAnim > 0) castAnim -= dt;
         atkTimer -= dt * p.asMult;
         if (atkTimer <= 0) {
-            if (g.aim(15)) {
-                float dx = g.aimX - p.x, dz = g.aimZ - p.z;
+            if (g.aim(me, 15)) {
+                float dx = p.aimX - p.x, dz = p.aimZ - p.z;
                 for (int i = 0; i < 1 + p.projBonus; i++) {
                     float[] d = dir(dx, dz, spreadOffset(i, 0.16f));
-                    Projectile pr = g.shoot(ProjKind.ORB, p.x, p.z, d[0], d[1], 19, orbDmg, 16, 0.4f, LIGHT);
+                    Projectile pr = g.shoot(me, ProjKind.ORB, p.x, p.z, d[0], d[1], 19, orbDmg, 16, 0.4f, LIGHT);
                     pr.markBonus = illum;
                     pr.y = 1.3f;
                 }
@@ -50,13 +52,13 @@ final class Lumina extends Champion {
 
     @Override
     boolean cast(Game g, int slot) {
-        Player p = g.player;
-        float dx = g.mouseX - p.x, dz = g.mouseZ - p.z;
+        Player p = me;
+        float dx = p.mouseX - p.x, dz = p.mouseZ - p.z;
         switch (slot) {
             case 0 -> {
                 p.face = (float) Math.atan2(dx, dz);
                 p.faceLock = 0.4f;
-                Projectile pr = g.shoot(ProjKind.BIND, p.x, p.z, dx, dz, 24, 55, 18, 0.6f, 0x9ff0ff);
+                Projectile pr = g.shoot(me, ProjKind.BIND, p.x, p.z, dx, dz, 24, 55, 18, 0.6f, 0x9ff0ff);
                 pr.pierce = bindTargets - 1;
                 pr.root = rootDur;
                 pr.mark = true;
@@ -72,17 +74,17 @@ final class Lumina extends Champion {
                 return true;
             }
             case 2 -> {
-                g.target(14);
+                g.target(me, 14);
                 Zone zn = new Zone();
-                zn.x = g.tx;
-                zn.z = g.tz;
+                zn.x = p.tx;
+                zn.z = p.tz;
                 zn.radius = zoneR * p.area;
                 zn.life = zn.max = 2.0f;
                 zn.slow = 0.5f;
                 zn.color = LIGHT;
                 final float zx = zn.x, zz = zn.z, zr = zn.radius;
                 zn.onEnd = () -> {
-                    g.aoe(zx, zz, zr, zoneDmg, e -> e.markT = 4f);
+                    g.aoe(me, zx, zz, zr, zoneDmg, e -> e.markT = 4f);
                     g.explosion(zx, zz, zr, LIGHT);
                 };
                 g.zones.add(zn);
@@ -105,6 +107,7 @@ final class Lumina extends Champion {
                 b.dmg = beamDmg;
                 b.color = LIGHT;
                 b.mark = true;
+                b.owner = me;
                 g.beams.add(b);
                 castAnim = 1.0f;
                 return true;
@@ -115,6 +118,18 @@ final class Lumina extends Champion {
 
     @Override
     int shieldColor() { return 0xffb0e0; }
+
+    @Override
+    void visualTick(float dt) {
+        super.visualTick(dt);
+        if (castAnim > 0) castAnim -= dt;
+    }
+
+    @Override
+    void writeVis(ByteBuffer b) { b.put(q(castAnim, 100)); }
+
+    @Override
+    void readVis(ByteBuffer b) { castAnim = u8(b) / 100f; }
 
     @Override
     List<Upgrade> special() {
