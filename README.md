@@ -11,36 +11,52 @@ kodla üretilir; harici asset yok. **Mac (Apple Silicon/Intel), Windows (x64/ARM
 
 macOS için gereken `-XstartOnFirstThread` bayrağını `Main` kendisi ekleyip oyunu yeniden başlatır.
 
-## Arkadaşına göndermek için tek dosya (Mac + Windows)
+## EXE / Mac uygulaması yapmak (arkadaşın Java kurmadan oynasın)
 
-```
-mvn package
-```
-(IntelliJ'de: sağdaki **Maven** paneli → *Lifecycle* → **package**.)
+`jpackage` (JDK ile gelir) oyunu **Java gömülü** bir uygulamaya çevirir: Windows'ta `RiftSurusu.exe`,
+Mac'te `RiftSurusu.app` (.dmg). Not: Windows EXE'si sadece Windows üzerinde, Mac uygulaması sadece Mac'te
+üretilebilir (jpackage çapraz derleme yapmaz). Üç yol var:
 
-Çıktı: `target/rift-surusu.jar`. İçinde tüm platformların kütüphaneleri var, aynı dosya her yerde çalışır.
+**A) GitHub ile otomatik (Windows bilgisayara gerek yok, önerilen)**
+1. `paketle/github-paketle.yml` dosyasını `.github/workflows/paketle.yml` olarak taşı (klasörleri oluştur).
+   Projeyi GitHub'a yükle (IntelliJ: *Git → GitHub → Share Project on GitHub*).
+2. GitHub'da repo → **Actions** → **Paketle** → **Run workflow**.
+3. ~5 dk sonra aynı sayfanın altındaki **Artifacts** kısmından indir:
+   `RiftSurusu-Windows` (içinde `RiftSurusu-Windows.zip`) ve `RiftSurusu-macOS` (`RiftSurusu-Mac.dmg`).
+   `v1.0` gibi bir etiket (tag) push'layınca da kendiliğinden çalışır.
 
-- Arkadaşının bilgisayarında **Java 17 veya üstü** olmalı (ücretsiz: <https://adoptium.net> → Temurin).
-- Çalıştırma: `java -jar rift-surusu.jar` ya da jar'ın yanına `dagitim/` klasöründeki başlatıcıyı koyup çift tıkla:
-  - Windows: `RiftSurusu.bat`
-  - Mac: `RiftSurusu.command`
+**B) Arkadaşının Windows bilgisayarında**
+1. Mac'te jar'ı üret: IntelliJ → sağdaki **Maven** paneli → *Lifecycle* → **package** → `target/rift-surusu.jar`.
+2. Jar'ı ve `paketle/paketle-windows.bat` dosyasını Windows'ta aynı klasöre koy (orada JDK 17+ kurulu olmalı).
+3. `paketle-windows.bat`'a çift tıkla → `RiftSurusu-Windows.zip`. İçindeki `RiftSurusu\RiftSurusu.exe` çalışır.
+   (EXE tek başına değil, yanındaki `app` ve `runtime` klasörleriyle birlikte çalışır; zip'i bütün olarak gönder.)
+
+**C) Mac uygulaması:** Terminalde `paketle/paketle-mac.sh` → `paketle/RiftSurusu-Mac.dmg`.
+
+**Sadece jar (Java kurulu olanlar için):** `java -jar target/rift-surusu.jar` ya da `dagitim/` başlatıcıları.
+Jar'ın içinde Mac, Windows ve Linux kütüphanelerinin hepsi var.
+
+İmzasız uygulama uyarıları (normal, virüs değil):
+- Windows: "Windows bilgisayarınızı korudu" → **Ek bilgi → Yine de çalıştır**.
+- Mac: "doğrulanmamış geliştirici" → uygulamaya **sağ tık → Aç**. (Kaldırmak için ücretli Apple/Microsoft kod imzalama sertifikası gerekir.)
 
 ## Co-op nasıl oynanır (internet üzerinden, Hamachi yok)
 
-Oyun doğrudan **UDP** ile bağlanır. Kendi sunucu gerekmez: her oyun, herkese açık bir STUN sunucusuna
-sorup kendi internet adresini öğrenir ve bunu bir **oda kodu** olarak gösterir (ör. `7KQ2-M9XA-4T`).
+Oyun doğrudan **UDP** ile bağlanır, Hamachi veya kendi sunucun gerekmez.
 
 1. Herkes ana menüde şampiyonunu seçer.
-2. Bir kişi **H — Oda kur** der. Diğerleri **J — Odaya katıl** der.
-3. **Kodları birbirinize gönderin** (WhatsApp, Discord...). Ekrandaki kodu *Kopyala* butonu veya Cmd/Ctrl+C ile kopyalayabilirsin.
-4. Katılan kişi host'un kodunu yapıştırır (Cmd/Ctrl+V) → ENTER.
-   Host da katılanın kodunu yapıştırır → ENTER. *(İki taraf da birbirine paket atınca modemler bağlantıya izin verir: "UDP hole punching".)*
-5. Lobide herkes görününce host, kutu boşken **ENTER**'a basar ve oyun başlar.
+2. Bir kişi **H — Oda kur** der. Oyun, modemine **UPnP** ile kendisi port açtırır ve bir **oda kodu** gösterir (ör. `7KQ2-M9XA-4T`).
+3. Kodu arkadaşına gönder (*Kopyala* butonu veya Cmd/Ctrl+C). Arkadaşın **J — Odaya katıl** der, kodu yapıştırır (Cmd/Ctrl+V), ENTER'a basar.
+4. Lobide herkes görününce host, kutu boşken **ENTER**'a basar ve oyun başlar.
 
-**Bağlanmazsa:** Bazı modem/operatörlerde (özellikle CGNAT veya "simetrik NAT" kullananlar, bazı mobil hatlar)
-delik açma çalışmaz. O zaman host, modeminde **UDP 27015** portunu kendi bilgisayarına yönlendirsin
-(port forwarding). Bunu yaptıktan sonra yalnızca katılan kişinin host kodunu girmesi yeter.
-Aynı evdeyseniz lobide yazan "Yerel ağ" adresini de girebilirsiniz.
+**Lobide "port otomatik açılamadı" yazarsa** (modemde UPnP kapalıysa): arkadaşın da kendi ekranındaki kodu
+sana göndersin, sen de onu kendi kutuna yapıştır. İki taraf aynı anda birbirine paket gönderince çoğu modem
+bağlantıya izin verir ("UDP hole punching").
+
+**Yine de bağlanmazsa:** Bazı operatörler (özellikle mobil hatlar, bazı fiber hatlar) **CGNAT** kullanır;
+modemin kendisi de bir ağın arkasındadır, dışarıdan gelen bağlantı hiçbir yöntemle kabul edilmez. Oyun bunu
+fark ederse lobide yazar. Çözüm: operatörden "statik/gerçek IP" istemek, odayı diğer kişinin açması ya da modem
+ayarlarında UDP 27015'i elle yönlendirmek. Aynı evdeyseniz lobideki "Yerel ağ" adresini girin.
 
 İlk açılışta **Windows Güvenlik Duvarı / macOS** "Java gelen bağlantıları kabul etsin mi?" diye sorarsa **İzin ver** de.
 
@@ -82,6 +98,30 @@ Aynı evdeyseniz lobide yazan "Yerel ağ" adresini de girebilirsiniz.
 - Belli aralıklarla etrafınızı saran **sürü dalgaları**.
 - **8:00**'de **Void Titanı** uyanır: her oyuncuya yere çarpma, minyon çağırma + mermi halkası, hücum. Onu yenin → zafer.
 
+## Güvenlik
+
+Oyunda ağ için şu önlemler var:
+
+- **Kod çalıştırma riski yok.** Gelen paketler Java nesnesi olarak açılmaz (serialization yok); sadece sayı ve kısa metin
+  okunur, her alan sınırlanır. Java bellek güvenli olduğu için C/C++ oyunlardaki "buffer overflow" türü açıklar oluşmaz.
+  Bozuk paket gelirse yok sayılır. Test: oyun boyunca saniyede ~180 rastgele/bozuk paket gönderildi, oyun çökmedi.
+- **Rastgele paketle oyuna karışılamaz.** Her oyuncuya bağlanırken rastgele bir oturum anahtarı verilir; anahtarı olmayan
+  girdi paketi atılır. İstemci de sadece bağlandığı host'tan gelen veriyi kabul eder.
+- **Hız hilesi yok.** Host hareketi kendisi hesaplar ve geçen gerçek süreden fazla hareketi reddeder.
+- **Oda en fazla 4 kişi** ve sadece lobideyken katılınabilir.
+- **Port açıkta kalmaz.** UPnP ile açılan port 2 saatlik kiralanır ve odadan çıkınca/oyun kapanınca silinir.
+  Port sadece oyun açıkken dinlenir.
+
+Bilmen gerekenler:
+
+- **Oda kodu = genel IP adresin.** Kodu sadece birlikte oynayacağın kişilere gönder, herkese açık yerlerde paylaşma
+  (IP adresinle yaklaşık konumun bulunabilir ve bağlantına yük bindirilebilir).
+- **Host'a güvenin.** Oyunu host hesapladığı için host hile yapabilir (diğerleri yapamaz). Arkadaşlar arası oyun için sorun değil.
+- **Trafik şifreli değil.** Ağı dinleyen biri oyun hareketlerini görebilir; içinde şifre veya kişisel bilgi yok.
+- **UPnP modemin bir özelliği.** Oyun sadece kendi portunu açıp kapatır; ama modemde UPnP açık olması, bilgisayarındaki
+  başka programların da port açabileceği anlamına gelir. İstemezsen modemde kapat; o zaman kod alışverişi yöntemi kullanılır.
+- Windows güvenlik duvarı sorarsa **Özel ağlar**'a izin ver. Ev Wi-Fi'ın Windows'ta "Ortak/Genel ağ" olarak ayarlıysa onu da işaretle; kafe gibi gerçekten ortak ağlarda host olma.
+
 ## Kod yapısı
 
 | Dosya | İçerik |
@@ -89,6 +129,7 @@ Aynı evdeyseniz lobide yazan "Yerel ağ" adresini de girebilirsiniz.
 | `Main` | Giriş noktası; macOS/Windows için JVM'i doğru bayraklarla yeniden başlatma |
 | `Game` | Oyun döngüsü, durumlar, oyuncular, spawn, çarpışma, efektler, çizim, HUD, lobi |
 | `Net` | UDP soket, STUN (genel adres keşfi), oda kodu |
+| `Upnp` | Modemde otomatik port açma/kapama (UPnP IGD), CGNAT tespiti |
 | `NetSession` | Co-op protokolü: lobi, girdi, dünya durumu, efekt olayları, istemci tahmini |
 | `Champion` + `Kivilcim`, `DemirMuhafiz`, `Lumina` | Şampiyon kitleri, 3D modeller, ağ görsel durumu |
 | `Player` | Oyuncu istatistikleri, girdi, yükseltmeler |

@@ -30,3 +30,8 @@ bin/
 .DS_Store
 ### Maven ###
 target/
+
+### Paketleme ###
+paketle/build/
+paketle/*.zip
+paketle/*.dmg

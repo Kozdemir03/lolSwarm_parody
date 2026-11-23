@@ -1,0 +1,61 @@
+# BU DOSYAYI .github/workflows/paketle.yml OLARAK TAŞI (GitHub sadece oradaki iş akışlarını çalıştırır).
+# GitHub'a yükleyince Windows EXE ve Mac DMG'yi bulutta otomatik üretir (Windows bilgisayar gerekmez).
+# Çalıştırma: GitHub'da repo > Actions > "Paketle" > Run workflow. Bitince sayfanın altındaki
+# "Artifacts" kısmından RiftSurusu-Windows ve RiftSurusu-macOS dosyalarını indir.
+name: Paketle
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Jar
+        run: mvn -B -q package
+
+      - name: Windows EXE
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/input | Out-Null
+          Copy-Item target/rift-surusu.jar build/input/
+          jpackage --type app-image --name RiftSurusu --input build/input --main-jar rift-surusu.jar `
+            --main-class swarm.Main --dest build/dist --app-version 1.0.0 --vendor "Rift Surusu" `
+            --add-modules java.base,java.desktop,java.management,jdk.unsupported `
+            --java-options "--enable-native-access=ALL-UNNAMED" --java-options "-Djava.awt.headless=true"
+          Compress-Archive -Path build/dist/RiftSurusu -DestinationPath RiftSurusu-Windows.zip
+
+      - name: Mac DMG (Apple Silicon)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p build/input && cp target/rift-surusu.jar build/input/
+          jpackage --type dmg --name RiftSurusu --input build/input --main-jar rift-surusu.jar \
+            --main-class swarm.Main --dest build/dist --app-version 1.0.0 --vendor "Rift Surusu" \
+            --mac-package-identifier swarm.riftsurusu \
+            --add-modules java.base,java.desktop,java.management,jdk.unsupported \
+            --java-options "-XstartOnFirstThread" --java-options "--enable-native-access=ALL-UNNAMED" \
+            --java-options "-Djava.awt.headless=true"
+          cp build/dist/*.dmg RiftSurusu-Mac.dmg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RiftSurusu-${{ runner.os }}
+          path: |
+            RiftSurusu-Windows.zip
+            RiftSurusu-Mac.dmg
+            target/rift-surusu.jar
+          if-no-files-found: ignore

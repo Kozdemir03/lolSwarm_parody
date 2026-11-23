@@ -18,7 +18,7 @@ import java.util.function.BiConsumer;
  */
 final class NetSession {
     static final short MAGIC = 0x5253; // "RS"
-    static final byte VER = 1;
+    static final byte VER = 2;
     static final byte T_PUNCH = 1, T_HELLO = 2, T_WELCOME = 3, T_INPUT = 4, T_HEAD = 5, T_CHUNK = 6, T_EVENTS = 7, T_BYE = 8;
     static final int MTU = 1200, CATS = 8;
     static final int C_ENEMY = 0, C_PROJ = 1, C_ORB = 2, C_TRAP = 3, C_ZONE = 4, C_BEAM = 5, C_TELE = 6, C_SWORD = 7;
@@ -27,6 +27,9 @@ final class NetSession {
     final Game g;
     final Net net;
     final boolean host;
+    Upnp upnp;
+    private boolean warned;
+    private final java.security.SecureRandom srng = new java.security.SecureRandom();
     String status = "";
     private final ByteBuffer out = ByteBuffer.allocate(1600);
     private final Random rng = new Random();
@@ -34,8 +37,8 @@ final class NetSession {
     // ------------------------------------------------------------------ host durumu
     static final class Peer {
         InetSocketAddress addr;
-        int id, lastSeq = -1;
-        float sinceHeard;
+        int id, lastSeq = -1, token;
+        float sinceHeard, moveBudget;
         final int[] castSeen = new int[4];
         boolean castInit;
     }
@@ -50,7 +53,7 @@ final class NetSession {
     InetSocketAddress hostAddr;
     int myId = -1;
     boolean connected;
-    private int nonce;
+    private int nonce, token;
     private float helloAcc, sinceHeard, connectT, keepAcc;
     private final int[] castCount = new int[4];
     private int seq;
@@ -78,6 +81,8 @@ final class NetSession {
         Net n = new Net(Net.DEFAULT_PORT);
         n.stunAsync();
         NetSession s = new NetSession(g, n, true);
+        s.upnp = new Upnp(n.port());
+        s.upnp.startAsync();
         s.status = "Oyuncular bekleniyor...";
         return s;
     }
@@ -90,10 +95,21 @@ final class NetSession {
         return s;
     }
 
-    String myCode() { return net.publicAddr != null ? Net.encode(net.publicAddr) : null; }
+    /** UPnP ile port açıldıysa o adres (tek yönlü yeter), değilse STUN'dan öğrenilen adres. */
+    private InetSocketAddress myAddr() {
+        if (upnp != null && upnp.external != null) return upnp.external;
+        return net.publicAddr;
+    }
+
+    String myCode() {
+        InetSocketAddress a = myAddr();
+        return a != null ? Net.encode(a) : null;
+    }
+
+    boolean upnpOk() { return upnp != null && upnp.st == Upnp.St.OK; }
 
     String publicStr() {
-        InetSocketAddress a = net.publicAddr;
+        InetSocketAddress a = myAddr();
         return a != null ? a.getAddress().getHostAddress() + ":" + a.getPort() : "?";
     }
 
@@ -109,7 +125,7 @@ final class NetSession {
                 status = "Bağlantı açılıyor → " + a.getAddress().getHostAddress() + ":" + a.getPort() + "  (arkadaşın da senin kodunu girmeli)";
             } else {
                 hostAddr = a;
-                nonce = rng.nextInt();
+                nonce = srng.nextInt();
                 connected = false;
                 connectT = 0;
                 helloAcc = 1;
@@ -126,6 +142,7 @@ final class NetSession {
         if (host) for (Peer p : peers) sendTo(p.addr);
         else if (hostAddr != null) sendTo(hostAddr);
         net.close();
+        if (upnp != null) upnp.close();
     }
 
     // ================================================================== alma
@@ -138,8 +155,11 @@ final class NetSession {
             try {
                 if (host) hostRecv(t, b, p.from());
                 else clientRecv(t, b, p.from());
-            } catch (BufferUnderflowException | IndexOutOfBoundsException e) {
+            } catch (BufferUnderflowException | IndexOutOfBoundsException | IllegalArgumentException e) {
                 // bozuk/kısa paket: yok say
+            } catch (RuntimeException e) {
+                // ağdan gelen hiçbir veri oyunu çökertemesin
+                if (!warned) { warned = true; System.err.println("Ağ paketi işlenemedi: " + e); }
             }
             if (g.net != this) return; // oturum kapandı
         }
@@ -147,6 +167,7 @@ final class NetSession {
             for (int i = peers.size() - 1; i >= 0; i--) {
                 Peer pe = peers.get(i);
                 pe.sinceHeard += dt;
+                pe.moveBudget = Math.min(0.5f, pe.moveBudget + dt);
                 if (pe.sinceHeard > TIMEOUT) dropPeer(pe, "bağlantısı koptu");
             }
         } else if (connected) {
@@ -176,6 +197,7 @@ final class NetSession {
                     pe = new Peer();
                     pe.addr = from;
                     pe.id = id;
+                    pe.token = srng.nextInt();
                     peers.add(pe);
                     g.players.add(g.makePlayer(id, Math.min(2, champ), false));
                     g.players.sort(Comparator.comparingInt(q -> q.id));
@@ -186,6 +208,7 @@ final class NetSession {
                 ByteBuffer o = begin(T_WELCOME);
                 o.putInt(nn);
                 o.put((byte) pe.id);
+                o.putInt(pe.token);
                 sendTo(from);
             }
             case T_INPUT -> {
@@ -204,14 +227,14 @@ final class NetSession {
     }
 
     private void readInput(Peer pe, ByteBuffer b) {
-        b.get(); // id
+        if (b.getInt() != pe.token) return; // sahte/eski paket
         int[] c = new int[4];
         for (int i = 0; i < 4; i++) c[i] = b.get() & 0xff;
         boolean lmb = b.get() != 0;
         float mx = b.getFloat(), mz = b.getFloat();
         int round = b.getShort();
         int choice = b.get();
-        int n = b.get() & 0xff;
+        int n = Math.min(32, b.get() & 0xff);
         Player p = g.find(pe.id);
         if (p == null) return;
         p.lmb = lmb;
@@ -226,14 +249,19 @@ final class NetSession {
                 pe.castSeen[i] = c[i];
             }
         }
-        if (choice >= 0 && g.state == Game.State.LEVELUP && round == g.pickRound) g.choose(p, choice);
+        if (choice >= 0 && choice < 3 && g.state == Game.State.LEVELUP && round == g.pickRound) g.choose(p, choice);
         for (int k = 0; k < n; k++) {
             int s = b.getInt();
             float ix = b.get() / 100f, iz = b.get() / 100f, idt = (b.get() & 0xff) / 1000f;
             if (s > pe.lastSeq) {
                 pe.lastSeq = s;
-                if (g.state == Game.State.PLAY && !p.downed && idt > 0)
-                    p.moveQueue.add(new float[]{ix, iz, Math.min(idt, 0.1f)});
+                idt = Math.min(idt, 0.1f);
+                // hız hilesine karşı: gerçek geçen süreden fazla hareket kabul edilmez
+                if (g.state == Game.State.PLAY && !p.downed && idt > 0 && pe.moveBudget >= idt
+                        && Math.abs(ix) <= 1.01f && Math.abs(iz) <= 1.01f) {
+                    pe.moveBudget -= idt;
+                    p.moveQueue.add(new float[]{ix, iz, idt});
+                }
             }
         }
     }
@@ -243,18 +271,21 @@ final class NetSession {
             case T_WELCOME -> {
                 int nn = b.getInt();
                 int id = b.get();
-                if (!connected && nn == nonce) {
+                int tok = b.getInt();
+                if (!connected && hostAddr != null && nn == nonce) {
                     connected = true;
                     myId = id;
+                    token = tok;
                     hostAddr = from; // NAT farklı port verdiyse ona uy
                     sinceHeard = 0;
                     status = "Bağlandı! Host'un oyunu başlatması bekleniyor.";
                 }
             }
-            case T_HEAD -> { if (connected) { sinceHeard = 0; readHead(b); } }
-            case T_CHUNK -> { if (connected) readChunk(b); }
-            case T_EVENTS -> { if (connected) readEvents(b); }
+            case T_HEAD -> { if (fromHost(from)) { sinceHeard = 0; readHead(b); } }
+            case T_CHUNK -> { if (fromHost(from)) readChunk(b); }
+            case T_EVENTS -> { if (fromHost(from)) readEvents(b); }
             case T_BYE -> {
+                if (connected && !fromHost(from)) return;
                 String why = b.remaining() > 0 ? str(b) : "";
                 if (connected) g.leaveToMenu("Host bağlantıyı kapattı " + why);
                 else { status = "Host reddetti: " + why; hostAddr = null; }
@@ -262,6 +293,9 @@ final class NetSession {
             default -> { }
         }
     }
+
+    /** İstemci sadece bağlandığı host'tan gelen dünya verisini kabul eder. */
+    private boolean fromHost(InetSocketAddress from) { return connected && from.equals(hostAddr); }
 
     private void dropPeer(Peer pe, String why) {
         peers.remove(pe);
@@ -343,7 +377,7 @@ final class NetSession {
 
     private void sendInput() {
         ByteBuffer o = begin(T_INPUT);
-        o.put((byte) myId);
+        o.putInt(token);
         for (int i = 0; i < 4; i++) o.put((byte) castCount[i]);
         Player p = g.player;
         o.put((byte) (p != null && p.lmb ? 1 : 0));
@@ -584,7 +618,9 @@ final class NetSession {
         if (sid <= lastHeadSnap) return;
         lastHeadSnap = sid;
         int gid = b.get() & 0xff;
-        Game.State st = Game.State.values()[b.get()];
+        int so = b.get();
+        if (so < 0 || so >= Game.State.values().length || so == Game.State.MENU.ordinal()) return;
+        Game.State st = Game.State.values()[so];
         float time = b.getFloat();
         int kills = b.getInt();
         int lvl = b.getShort();
@@ -622,7 +658,7 @@ final class NetSession {
         int np = b.get() & 0xff;
         HashSet<Integer> seen = new HashSet<>();
         for (int k = 0; k < np; k++) {
-            int id = b.get(), champ = b.get();
+            int id = b.get(), champ = Math.max(0, Math.min(2, b.get()));
             float x = pos(b), z = pos(b), face = ang(b);
             float hp = b.getShort(), maxHp = b.getShort(), shield = b.getShort();
             int fl = b.get();

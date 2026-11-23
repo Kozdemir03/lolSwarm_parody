@@ -47,8 +47,11 @@ public final class Main {
         boolean needUnsafe = feature >= 23 && jvmArgs.stream().noneMatch(a -> a.startsWith("--sun-misc-unsafe-memory-access"));
         if (!needFirstThread && !needUnsafe) return false;
 
+        String exe = javaExecutable();
+        // jpackage ile yapılan uygulamada java komutu yoktur; bayraklar zaten uygulamaya gömülüdür
+        if (!Files.exists(Paths.get(exe))) return false;
         List<String> cmd = new ArrayList<>();
-        cmd.add(javaExecutable());
+        cmd.add(exe);
         if (mac) cmd.add("-XstartOnFirstThread");
         if (feature >= 22) cmd.add("--enable-native-access=ALL-UNNAMED");
         if (feature >= 23) cmd.add("--sun-misc-unsafe-memory-access=allow");

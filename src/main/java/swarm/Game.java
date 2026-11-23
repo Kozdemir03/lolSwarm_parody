@@ -2001,15 +2001,24 @@ public final class Game {
         ui.textC("Kopyala", hit[0] + hit[2] / 2, hit[1] + 9, 18, 0xffffffff);
         y += 60;
         if (net != null) {
+            if (net.upnp != null) {
+                Upnp.St us = net.upnp.st;
+                int uc = us == Upnp.St.OK ? 0xff5ad17a : (us == Upnp.St.WORKING ? 0xffd0d6e0 : 0xffffb347);
+                for (String line : ui.wrap(net.upnp.status, pw, 15)) { ui.text(line, px, y, 15, uc); y += 20; }
+                y += 2;
+            }
             String st = net.net.stunStatus;
-            if (!"hazır".equals(st)) { ui.text(st, px, y, 15, 0xffffb347); y += 22; }
+            if (!"hazır".equals(st) && !net.upnpOk()) { ui.text(st, px, y, 15, 0xffffb347); y += 22; }
             ui.text("Doğrudan adres: " + net.publicStr() + "     Yerel ağ: " + net.localStr(), px, y, 15, 0xff8fa0bc);
             y += 22;
             ui.text("(Kopyalama: Cmd/Ctrl + C)", px, y, 13, 0x90ffffff);
             y += 34;
         }
 
-        ui.text(host ? "2) Arkadaşının kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:" : "2) Host'un kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:", px, y, 18, 0xffd0d6e0);
+        String step2 = !host ? "2) Host'un kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:"
+                : net != null && net.upnpOk() ? "2) Gerek yok! (Arkadaşın bağlanamazsa onun kodunu buraya yapıştır)"
+                : "2) Arkadaşının kodunu buraya yapıştır (Cmd/Ctrl + V) ve ENTER:";
+        ui.text(step2, px, y, 18, 0xffd0d6e0);
         y += 32;
         ui.rect(px, y, pw, 48, 0xff0c111c);
         ui.frame(px, y, pw, 48, 2, 0xff7fe0ff);
